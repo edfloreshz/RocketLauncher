@@ -1,4 +1,4 @@
-// Iced 0.14 GUI for the Rocket League / Epic Games launcher.
+// egui/eframe GUI for the Rocket League / Epic Games launcher.
 //
 // Layout:
 //  - Settings fields: RL exe path, Proton path, compat data path, Steam
@@ -8,51 +8,31 @@
 //    exists.
 //  - Status line showing what's currently happening / any error.
 //
-// All network + process work happens inside `Task::perform` using the async
-// reqwest client, run on iced's tokio executor so the UI thread never blocks.
+// All network + process work happens inside background tasks using a dedicated
+// tokio Runtime so the UI thread never blocks.
 
-use iced::futures::sink::SinkExt;
-use iced::widget::{button, checkbox, column, container, row, scrollable, text, text_input};
-use iced::{Element, Length, Task, Theme};
+use eframe::egui;
+use gilrs::{Axis, Button, Event, EventType, Gilrs};
 use rocket_launcher::{
     Config, EPIC_LOGIN_URL, LaunchCredentials, discovery, exchange_code_for_refresh_token,
+    gamepad::{Focus, GamepadAction},
     get_launch_credentials, launch_game, load_config, open_browser, save_config, updater,
 };
+use std::sync::{
+    Arc,
+    mpsc::{self, Receiver, Sender},
+};
 
-pub fn main() -> iced::Result {
-    iced::application(App::new, App::update, App::view)
-        .title(App::title)
-        .theme(App::theme)
-        .run()
-}
-
-#[derive(Debug, Clone)]
-enum Message {
-    // Settings field edits
-    RocketLeaguePathChanged(String),
-    ProtonPathChanged(String),
-    CompatDataPathChanged(String),
-    SteamInstallPathChanged(String),
-    SkipEacToggled(bool),
-    SaveSettings,
-    AutoDetect,
-
-    // Login flow
-    OpenLoginPage,
-    AuthCodeChanged(String),
-    SubmitAuthCode,
+// Represents events sent from background async/blocking tasks back to the UI thread.
+enum AppMsg {
     LoginFinished(Result<String, String>),
-
-    // Launch flow
-    Launch,
     LaunchFinished(Result<(), String>),
-
-    // Update flow
-    CheckForUpdate,
     UpdateCheckFinished(Result<UpdateCheckResult, String>),
-    RunUpdate,
     UpdateLogLine(String),
     UpdateFinished(Result<(), String>),
+    Gamepad(GamepadAction),
+    GamepadConnected,
+    GamepadDisconnected,
 }
 
 #[derive(Debug, Clone)]
@@ -61,26 +41,148 @@ struct UpdateCheckResult {
     update_available: bool,
 }
 
+pub fn main() -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([600.0, 700.0])
+            .with_title("Rocket League Launcher"),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Rocket League Launcher",
+        options,
+        Box::new(|cc| Ok(Box::new(App::new(cc.egui_ctx.clone())))),
+    )
+}
+
 struct App {
     cfg: Config,
+    ctx: egui::Context,
     auth_code_input: String,
     status: String,
     busy: bool,
     logged_in: bool,
-
     checking_update: bool,
     update_available: bool,
     installed_version: Option<String>,
     updating: bool,
     update_log: Vec<String>,
+    background: egui::TextureHandle,
+
+    // Gamepad
+    gamepad_connected: bool,
+    focus: Option<Focus>,
+    select_pressed: bool,
+
+    // Threading / async interop
+    rt: Arc<tokio::runtime::Runtime>,
+    tx: Sender<AppMsg>,
+    rx: Receiver<AppMsg>,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(ctx: egui::Context) -> Self {
         let cfg = load_config().unwrap_or_default();
         let logged_in = !cfg.epic_refresh_token.trim().is_empty();
+        let (tx, rx) = mpsc::channel();
+        let gilrs_tx = tx.clone();
+        let gilrs_ctx = ctx.clone();
+
+        // Spin up a dedicated tokio runtime for reqwest, isolated from winit's main thread.
+        let rt = Arc::new(tokio::runtime::Runtime::new().expect("Failed to build tokio runtime"));
+
+        std::thread::spawn(move || {
+            // Initialize gilrs. If no gamepads are connected, it still runs safely.
+            if let Ok(mut gilrs) = Gilrs::new() {
+                let mut left_stick_y_neutral = true;
+                let mut left_stick_x_neutral = true;
+
+                loop {
+                    while let Some(Event { event, .. }) = gilrs.next_event() {
+                        match event {
+                            EventType::Connected => {
+                                let _ = gilrs_tx.send(AppMsg::GamepadConnected);
+                            }
+                            EventType::Disconnected => {
+                                let _ = gilrs_tx.send(AppMsg::GamepadDisconnected);
+                            }
+
+                            // 1. Handle D-pad and Face Buttons
+                            EventType::ButtonPressed(button, _) => {
+                                let action = match button {
+                                    Button::DPadUp => Some(GamepadAction::Up),
+                                    Button::DPadDown => Some(GamepadAction::Down),
+                                    Button::DPadLeft => Some(GamepadAction::Left),
+                                    Button::DPadRight => Some(GamepadAction::Right),
+                                    Button::South => Some(GamepadAction::Select), // A / Cross
+                                    Button::Start => Some(GamepadAction::LaunchShortcut), // Start button
+                                    _ => None,
+                                };
+                                if let Some(act) = action {
+                                    let _ = gilrs_tx.send(AppMsg::Gamepad(act));
+                                    gilrs_ctx.request_repaint();
+                                }
+                            }
+                            // 2. Convert Left Analog Stick to D-pad steps (with a deadzone)
+                            EventType::AxisChanged(axis, value, _) => {
+                                const THRESHOLD: f32 = 0.5;
+                                if axis == Axis::LeftStickY {
+                                    if value.abs() < 0.2 {
+                                        left_stick_y_neutral = true;
+                                    } else if left_stick_y_neutral && value.abs() > THRESHOLD {
+                                        left_stick_y_neutral = false;
+                                        // Gilrs Y-axis is positive pointing up
+                                        let act = if value > 0.0 {
+                                            GamepadAction::Up
+                                        } else {
+                                            GamepadAction::Down
+                                        };
+                                        let _ = gilrs_tx.send(AppMsg::Gamepad(act));
+                                        gilrs_ctx.request_repaint();
+                                    }
+                                }
+                                if axis == Axis::LeftStickX {
+                                    if value.abs() < 0.2 {
+                                        left_stick_x_neutral = true;
+                                    } else if left_stick_x_neutral && value.abs() > THRESHOLD {
+                                        left_stick_x_neutral = false;
+                                        let act = if value > 0.0 {
+                                            GamepadAction::Right
+                                        } else {
+                                            GamepadAction::Left
+                                        };
+                                        let _ = gilrs_tx.send(AppMsg::Gamepad(act));
+                                        gilrs_ctx.request_repaint();
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    gilrs.inc();
+                    std::thread::sleep(std::time::Duration::from_millis(16)); // ~60Hz polling
+                }
+            }
+        });
+
+        // NOTE: To load a real image file, add the `image` crate to your Cargo.toml and use:
+        let bg_texture = ctx.load_texture(
+            "bg-main",
+            {
+                let image_bytes = include_bytes!("../assets/background.jpg");
+                let decoded = image::load_from_memory(image_bytes).unwrap().to_rgba8();
+                egui::ColorImage::from_rgba_unmultiplied(
+                    [decoded.width() as _, decoded.height() as _],
+                    &decoded,
+                )
+            },
+            Default::default(),
+        );
+
         Self {
             cfg,
+            ctx,
             auth_code_input: String::new(),
             status: if logged_in {
                 "Ready. Session loaded from config.json.".to_string()
@@ -95,426 +197,529 @@ impl App {
             installed_version: None,
             updating: false,
             update_log: Vec::new(),
+            background: bg_texture,
+
+            gamepad_connected: false,
+            focus: None,
+            select_pressed: false,
+
+            rt,
+            tx,
+            rx,
         }
     }
 
-    fn title(&self) -> String {
-        "Rocket League Launcher".to_string()
-    }
+    /// Drains the channel for any messages completed by background threads.
+    fn process_messages(&mut self) {
+        while let Ok(msg) = self.rx.try_recv() {
+            match msg {
+                AppMsg::GamepadConnected => {
+                    self.gamepad_connected = true;
 
-    fn theme(&self) -> Theme {
-        Theme::TokyoNight
-    }
-
-    fn update(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::RocketLeaguePathChanged(v) => {
-                self.cfg.rocket_league_path = v;
-                Task::none()
-            }
-            Message::ProtonPathChanged(v) => {
-                self.cfg.proton_path = v;
-                Task::none()
-            }
-            Message::CompatDataPathChanged(v) => {
-                self.cfg.compat_data_path = v;
-                Task::none()
-            }
-            Message::SteamInstallPathChanged(v) => {
-                self.cfg.steam_install_path = v;
-                Task::none()
-            }
-            Message::SkipEacToggled(v) => {
-                self.cfg.skip_eac = v;
-                Task::none()
-            }
-            Message::SaveSettings => {
-                match save_config(&self.cfg) {
-                    Ok(()) => self.status = "Settings saved.".to_string(),
-                    Err(e) => self.status = format!("Failed to save settings: {e}"),
+                    if self.focus.is_none() {
+                        self.focus = Some(Focus::AutoDetect);
+                    }
                 }
-                Task::none()
-            }
-            Message::AutoDetect => {
-                let found = discovery::discover_all();
-                let mut notes = Vec::new();
-
-                if let Some(p) = found.rocket_league_path {
-                    self.cfg.rocket_league_path = p.to_string_lossy().to_string();
-                    notes.push("RL exe");
+                AppMsg::GamepadDisconnected => {
+                    self.gamepad_connected = false;
+                    self.focus = None;
                 }
-                if let Some(p) = found.steam_install_path {
-                    self.cfg.steam_install_path = p.to_string_lossy().to_string();
-                    notes.push("Steam install");
-                }
-                if let Some(p) = found.proton_path {
-                    self.cfg.proton_path = p.to_string_lossy().to_string();
-                    notes.push("Proton");
-                }
-                if let Some(p) = found.compat_data_path {
-                    self.cfg.compat_data_path = p.to_string_lossy().to_string();
-                    notes.push("Proton prefix");
-                }
-
-                self.status = if notes.is_empty() {
-                    "Auto-detect found nothing — fill in paths manually.".to_string()
-                } else {
-                    format!(
-                        "Auto-detected: {}. Review and Save settings.",
-                        notes.join(", ")
-                    )
-                };
-                if let Err(e) = save_config(&self.cfg) {
-                    self.status = format!("{} (failed to save: {e})", self.status);
-                }
-                Task::none()
-            }
-
-            Message::OpenLoginPage => {
-                open_browser(EPIC_LOGIN_URL);
-                self.status =
-                    "Browser opened. Log in, then paste the authorization code below.".to_string();
-                Task::none()
-            }
-            Message::AuthCodeChanged(v) => {
-                self.auth_code_input = v;
-                Task::none()
-            }
-            Message::SubmitAuthCode => {
-                let code = self.auth_code_input.trim().to_string();
-                if code.len() != 32 {
-                    self.status = format!(
-                        "Authorization code should be 32 characters, got {}.",
-                        code.len()
-                    );
-                    return Task::none();
-                }
-                self.busy = true;
-                self.status = "Exchanging authorization code...".to_string();
-                Task::perform(
-                    async move {
-                        let client = reqwest::Client::new();
-                        exchange_code_for_refresh_token(&client, &code)
-                            .await
-                            .map_err(|e| e.to_string())
-                    },
-                    Message::LoginFinished,
-                )
-            }
-            Message::LoginFinished(result) => {
-                self.busy = false;
-                match result {
-                    Ok(refresh_token) => {
-                        self.cfg.epic_refresh_token = refresh_token;
-                        self.logged_in = true;
-                        self.auth_code_input.clear();
-                        if let Err(e) = save_config(&self.cfg) {
-                            self.status = format!("Logged in, but failed to save session: {e}");
-                        } else {
-                            self.status = "Logged in. You can launch now.".to_string();
+                AppMsg::Gamepad(action) => {
+                    self.gamepad_connected = true;
+                    if self.focus.is_none() {
+                        self.focus = Some(Focus::AutoDetect);
+                    }
+                    match action {
+                        GamepadAction::Up | GamepadAction::Left => {
+                            if let Some(focus) = self.focus {
+                                self.focus = Some(focus.previous(self.logged_in));
+                            }
+                        }
+                        GamepadAction::Down | GamepadAction::Right => {
+                            if let Some(focus) = self.focus {
+                                self.focus = Some(focus.next(self.logged_in));
+                            }
+                        }
+                        GamepadAction::Select => {
+                            self.select_pressed = true;
+                        }
+                        GamepadAction::LaunchShortcut => {
+                            // Global hotkey: Pressing 'Start' on the controller launches the game instantly
+                            if self.logged_in
+                                && !self.busy
+                                && !self.cfg.rocket_league_path.trim().is_empty()
+                            {
+                                self.busy = true;
+                                self.status =
+                                    "Authenticating with Epic Games (Gamepad)...".to_string();
+                                let cfg = self.cfg.clone();
+                                let tx = self.tx.clone();
+                                let ctx_clone = self.ctx.clone();
+                                self.rt.spawn(async move {
+                                    let res = do_launch(cfg).await;
+                                    let _ = tx.send(AppMsg::LaunchFinished(res));
+                                    ctx_clone.request_repaint();
+                                });
+                            }
                         }
                     }
-                    Err(e) => {
-                        self.status = format!("Login failed: {e}");
+                }
+
+                AppMsg::LoginFinished(result) => {
+                    self.busy = false;
+                    match result {
+                        Ok(refresh_token) => {
+                            self.cfg.epic_refresh_token = refresh_token;
+                            self.logged_in = true;
+                            self.auth_code_input.clear();
+
+                            self.focus = Some(Focus::CheckUpdates);
+
+                            if let Err(e) = save_config(&self.cfg) {
+                                self.status = format!("Logged in, but failed to save session: {e}");
+                            } else {
+                                self.status = "Logged in. You can launch now.".to_string();
+                            }
+                        }
+                        Err(e) => {
+                            self.status = format!("Login failed: {e}");
+                        }
                     }
                 }
-                Task::none()
-            }
-
-            Message::Launch => {
-                if self.cfg.rocket_league_path.trim().is_empty() {
-                    self.status = "Set the Rocket League executable path first.".to_string();
-                    return Task::none();
+                AppMsg::LaunchFinished(result) => {
+                    self.busy = false;
+                    match result {
+                        Ok(()) => self.status = "Game launched.".to_string(),
+                        Err(e) => self.status = format!("Launch failed: {e}"),
+                    }
                 }
-                self.busy = true;
-                self.status = "Authenticating...".to_string();
-                let cfg = self.cfg.clone();
-                Task::perform(async move { do_launch(cfg).await }, Message::LaunchFinished)
-            }
-            Message::LaunchFinished(result) => {
-                self.busy = false;
-                match result {
-                    Ok(()) => self.status = "Game launched.".to_string(),
-                    Err(e) => self.status = format!("Launch failed: {e}"),
-                }
-                Task::none()
-            }
-
-            Message::CheckForUpdate => {
-                self.checking_update = true;
-                self.status = "Checking for Rocket League updates via Legendary...".to_string();
-                Task::perform(
-                    async {
-                        tokio::task::spawn_blocking(|| {
-                            updater::check_for_update().map_err(|e| e.to_string())
-                        })
-                        .await
-                        .unwrap_or_else(|e| Err(format!("update check task panicked: {e}")))
-                        .map(|status| UpdateCheckResult {
-                            installed_version: status.installed_version,
-                            update_available: status.update_available,
-                        })
-                    },
-                    Message::UpdateCheckFinished,
-                )
-            }
-            Message::UpdateCheckFinished(result) => {
-                self.checking_update = false;
-                match result {
-                    Ok(r) => {
-                        self.installed_version = r.installed_version.clone();
-                        self.update_available = r.update_available;
-                        self.status = match (&r.installed_version, r.update_available) {
-                            (Some(v), true) => {
-                                format!(
+                AppMsg::UpdateCheckFinished(result) => {
+                    self.checking_update = false;
+                    match result {
+                        Ok(r) => {
+                            self.installed_version = r.installed_version.clone();
+                            self.update_available = r.update_available;
+                            self.status = match (&r.installed_version, r.update_available) {
+                                (Some(v), true) => format!(
                                     "Update available (installed: {v}). Click Update to download it."
-                                )
-                            }
-                            (Some(v), false) => format!("Up to date (installed: {v})."),
-                            (None, _) => {
-                                "Rocket League isn't installed via Legendary — nothing to check."
-                                    .to_string()
-                            }
-                        };
-                    }
-                    Err(e) => {
-                        self.status = format!("Update check failed: {e}");
+                                ),
+                                (Some(v), false) => format!("Up to date (installed: {v})."),
+                                (None, _) => {
+                                    "Rocket League isn't installed via Legendary — nothing to check."
+                                        .to_string()
+                                }
+                            };
+                        }
+                        Err(e) => {
+                            self.status = format!("Update check failed: {e}");
+                        }
                     }
                 }
-                Task::none()
-            }
-
-            Message::RunUpdate => {
-                self.updating = true;
-                self.update_log.clear();
-                self.status = "Updating Rocket League via Legendary...".to_string();
-                Task::stream(update_stream())
-            }
-            Message::UpdateLogLine(line) => {
-                self.update_log.push(line);
-                // Keep the log from growing unbounded during long installs.
-                if self.update_log.len() > 500 {
-                    let excess = self.update_log.len() - 500;
-                    self.update_log.drain(0..excess);
-                }
-                Task::none()
-            }
-            Message::UpdateFinished(result) => {
-                self.updating = false;
-                match result {
-                    Ok(()) => {
-                        self.status = "Update complete.".to_string();
-                        self.update_available = false;
+                AppMsg::UpdateLogLine(line) => {
+                    self.update_log.push(line);
+                    if self.update_log.len() > 500 {
+                        let excess = self.update_log.len() - 500;
+                        self.update_log.drain(0..excess);
                     }
-                    Err(e) => self.status = format!("Update failed: {e}"),
                 }
-                Task::none()
+                AppMsg::UpdateFinished(result) => {
+                    self.updating = false;
+                    match result {
+                        Ok(()) => {
+                            self.status = "Update complete.".to_string();
+                            self.update_available = false;
+                        }
+                        Err(e) => self.status = format!("Update failed: {e}"),
+                    }
+                }
             }
         }
     }
 
-    fn view(&self) -> Element<'_, Message> {
-        let path_field = |label: &str, value: &str, on_change: fn(String) -> Message| {
-            let label = label.to_string();
-            let value = value.to_string();
-            column![
-                text(label).size(14),
-                text_input("", &value).on_input(on_change).padding(6),
-            ]
-            .spacing(4)
-        };
+    fn gamepad_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        enabled: bool,
+        focus: Focus,
+        button: egui::Button<'_>,
+    ) -> bool {
+        let mut button = button;
 
-        let settings = column![
-            text("Settings").size(20),
-            path_field(
-                "Rocket League executable path",
-                &self.cfg.rocket_league_path,
-                Message::RocketLeaguePathChanged,
-            ),
-            path_field(
-                "Proton binary path (leave blank to run natively)",
-                &self.cfg.proton_path,
-                Message::ProtonPathChanged,
-            ),
-            path_field(
-                "Proton prefix / compat data path",
-                &self.cfg.compat_data_path,
-                Message::CompatDataPathChanged,
-            ),
-            path_field(
-                "Steam install path",
-                &self.cfg.steam_install_path,
-                Message::SteamInstallPathChanged,
-            ),
-            checkbox(self.cfg.skip_eac)
-                .label("Skip Easy Anti-Cheat (offline modes only)")
-                .on_toggle(Message::SkipEacToggled),
-            row![
-                button("Auto-detect paths").on_press(Message::AutoDetect),
-                button("Save settings").on_press(Message::SaveSettings),
-            ]
-            .spacing(10),
-        ]
-        .spacing(10);
+        if Some(focus) == self.focus {
+            button = button.stroke(egui::Stroke::new(3.0, egui::Color32::YELLOW));
+        }
 
-        let login_section: Element<'_, Message> = if self.logged_in {
-            column![
-                text("Logged in.").size(14),
-                button("Log in with a different account").on_press(Message::OpenLoginPage),
-            ]
-            .spacing(8)
-            .into()
-        } else {
-            column![
-                text("Login").size(20),
-                button("Open Epic login page").on_press(Message::OpenLoginPage),
-                text_input("Paste authorization code here", &self.auth_code_input)
-                    .on_input(Message::AuthCodeChanged)
-                    .padding(6),
-                button("Submit code").on_press(Message::SubmitAuthCode),
-            ]
-            .spacing(8)
-            .into()
-        };
+        let response = ui.add_enabled(enabled, button);
 
-        let launch_button = if self.logged_in {
-            button(text(if self.busy { "Working..." } else { "Launch" }))
-                .on_press_maybe((!self.busy).then_some(Message::Launch))
-        } else {
-            button("Launch").on_press_maybe(None)
-        };
-
-        let update_check_label = if self.checking_update {
-            "Checking..."
-        } else {
-            "Check for updates"
-        };
-        let update_section = {
-            let mut col = column![
-                text("Updates (via Legendary)").size(20),
-                row![
-                    button(update_check_label).on_press_maybe(
-                        (!self.checking_update && !self.updating)
-                            .then_some(Message::CheckForUpdate)
-                    ),
-                    button(if self.updating {
-                        "Updating..."
-                    } else {
-                        "Update now"
-                    })
-                    .on_press_maybe(
-                        (self.update_available && !self.updating).then_some(Message::RunUpdate)
-                    ),
-                ]
-                .spacing(10),
-            ]
-            .spacing(8);
-
-            if let Some(v) = &self.installed_version {
-                col = col.push(text(format!("Installed version: {v}")).size(14));
-            }
-
-            if !self.update_log.is_empty() {
-                let log_text = self.update_log.join("\n");
-                col = col.push(
-                    scrollable(text(log_text).size(12))
-                        .height(Length::Fixed(160.0))
-                        .width(Length::Fill),
-                );
-            }
-
-            col
-        };
-
-        let content = column![
-            settings,
-            login_section,
-            update_section,
-            row![launch_button].spacing(10),
-            text(&self.status).size(14),
-        ]
-        .spacing(20)
-        .padding(20)
-        .max_width(560);
-
-        container(content)
-            .width(Length::Fill)
-            .center_x(Length::Fill)
-            .into()
+        response.clicked()
+            || (enabled && Some(focus) == self.focus && std::mem::take(&mut self.select_pressed))
     }
 }
 
-async fn do_launch(cfg: Config) -> Result<(), String> {
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 1. Process any incoming messages from background threads
+        self.process_messages();
+        let ctx = ui.ctx().clone();
+
+        // 2. FULL-SCREEN OPTIMIZATIONS
+        // Globally scale everything up by 35% for readability in full screen
+        ctx.set_pixels_per_point(1.35);
+
+        // Increase spacing between elements and add chunkier padding to buttons
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 16.0);
+        ui.spacing_mut().button_padding = egui::vec2(16.0, 10.0);
+
+        // 3. BACKGROUND IMAGE PAINTING
+        // Paint the background across the entire window before drawing any UI elements on top
+        let screen_rect = ui.max_rect();
+
+        // Get dimensions and find aspect ratios
+        let screen_aspect = screen_rect.width() / screen_rect.height();
+        let texture_size = self.background.size_vec2();
+        let texture_aspect = texture_size.x / texture_size.y;
+
+        // Calculate a cropped UV rectangle based on which dimension is "too wide"
+        let uv_rect = if screen_aspect > texture_aspect {
+            // The window is wider than the image -> crop the top and bottom of the image
+            let uv_height = texture_aspect / screen_aspect;
+            let y_min = 0.5 * (1.0 - uv_height);
+            let y_max = 0.5 * (1.0 + uv_height);
+            egui::Rect::from_min_max(egui::pos2(0.0, y_min), egui::pos2(1.0, y_max))
+        } else {
+            // The window is taller than the image -> crop the left and right sides
+            let uv_width = screen_aspect / texture_aspect;
+            let x_min = 0.5 * (1.0 - uv_width);
+            let x_max = 0.5 * (1.0 + uv_width);
+            egui::Rect::from_min_max(egui::pos2(x_min, 0.0), egui::pos2(x_max, 1.0))
+        };
+
+        ui.painter().image(
+            self.background.id(),
+            screen_rect,
+            uv_rect,
+            egui::Color32::WHITE.linear_multiply(1.),
+        );
+
+        // 4. CENTERED CONTAINER LAYOUT
+        // Locks the UI width to a clean bounding box centered on screen
+        let available_height = ui.available_height();
+
+        ui.horizontal(|ui| {
+            let total_width = ui.available_width();
+            let container_width = total_width.min(1000.0);
+
+            // Calculate the exact spacer needed on the left to keep us dead center
+            let spacer_width = (total_width - container_width) / 2.0;
+            ui.add_space(spacer_width);
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(container_width, available_height),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_black_alpha(200))
+                    .outer_margin(24.)
+                    .inner_margin(24.)
+                    .corner_radius(12.)
+                    .show(ui, |ui| {
+                        // --- LAUNCH SECTION ---
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), 0.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                let response = ui.add(egui::Checkbox::new(
+                                    &mut self.cfg.skip_eac,
+                                    "Skip Easy Anti-Cheat (offline modes only)"
+                                ));
+
+                                if Some(Focus::SkipEasyAntiCheat) == self.focus {
+                                    ui.painter().rect_stroke(
+                                        response.rect.expand(2.0),
+                                        4.0,
+                                        egui::Stroke::new(2.0, egui::Color32::YELLOW),
+                                        egui::StrokeKind::Outside,
+                                    );
+                                }
+
+                                let gamepad_activated = Some(Focus::SkipEasyAntiCheat) == self.focus && std::mem::take(&mut self.select_pressed);
+                                if gamepad_activated {
+                                    self.cfg.skip_eac = !self.cfg.skip_eac;
+                                }
+                                if response.clicked() || gamepad_activated {
+                                    if let Err(e) = save_config(&self.cfg) {
+                                        self.status = format!("{} (failed to save: {e})", self.status);
+                                    }
+                                }
+
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let launch_label = if self.busy { "Working..." } else { "🚀 LAUNCH ROCKET LEAGUE" };
+                                    let enabled = self.logged_in && !self.busy;
+                                    let launch_btn = egui::Button::new(egui::RichText::new(launch_label).size(18.0).strong())
+                                        .fill(egui::Color32::from_rgb(0, 102, 204));
+
+                                    let clicked = self.gamepad_button(ui, enabled, Focus::Launch, launch_btn);
+
+                                    if clicked {
+                                        if self.cfg.rocket_league_path.trim().is_empty() {
+                                            self.status = "Set the Rocket League executable path first.".to_string();
+                                        } else {
+                                            self.busy = true;
+                                            self.status = "Authenticating with Epic Games...".to_string();
+
+                                            let cfg = self.cfg.clone();
+                                            let tx = self.tx.clone();
+                                            let ctx = ctx.clone();
+
+                                            self.rt.spawn(async move {
+                                                let res = do_launch(cfg).await;
+                                                let _ = tx.send(AppMsg::LaunchFinished(res));
+                                                ctx.request_repaint();
+                                            });
+                                        }
+                                    }
+                                });
+                            }
+                        );
+
+                        ui.separator();
+
+                        ui.label(egui::RichText::new(&self.status).size(14.0).italics());
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            // --- SETTINGS SECTION ---
+                            ui.heading(egui::RichText::new("Launcher Settings").size(24.0).strong());
+                            ui.add_space(4.0);
+
+                            egui::Grid::new("settings_grid")
+                                .num_columns(2)
+                                .spacing([20.0, 14.0])
+                                .min_row_height(32.0)
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new("Rocket League Executable:").size(15.0));
+                                    ui.add(egui::TextEdit::singleline(&mut self.cfg.rocket_league_path).desired_width(f32::INFINITY));
+                                    ui.end_row();
+
+                                    ui.label(egui::RichText::new("Proton Binary Path:").size(15.0));
+                                    ui.add(egui::TextEdit::singleline(&mut self.cfg.proton_path).desired_width(f32::INFINITY));
+                                    ui.end_row();
+
+                                    ui.label(egui::RichText::new("Compat Data Prefix:").size(15.0));
+                                    ui.add(egui::TextEdit::singleline(&mut self.cfg.compat_data_path).desired_width(f32::INFINITY));
+                                    ui.end_row();
+
+                                    ui.label(egui::RichText::new("Steam Install Path:").size(15.0));
+                                    ui.add(egui::TextEdit::singleline(&mut self.cfg.steam_install_path).desired_width(f32::INFINITY));
+                                    ui.end_row();
+                                });
+
+                            ui.horizontal(|ui| {
+                                let clicked = self.gamepad_button(ui, true, Focus::AutoDetect, egui::Button::new("🔄 Auto-detect paths"));
+                                if clicked {
+                                    let found = discovery::discover_all();
+                                    let mut notes = Vec::new();
+
+                                    if let Some(p) = found.rocket_league_path {
+                                        self.cfg.rocket_league_path = p.to_string_lossy().to_string();
+                                        notes.push("RL exe");
+                                    }
+                                    if let Some(p) = found.steam_install_path {
+                                        self.cfg.steam_install_path = p.to_string_lossy().to_string();
+                                        notes.push("Steam install");
+                                    }
+                                    if let Some(p) = found.proton_path {
+                                        self.cfg.proton_path = p.to_string_lossy().to_string();
+                                        notes.push("Proton");
+                                    }
+                                    if let Some(p) = found.compat_data_path {
+                                        self.cfg.compat_data_path = p.to_string_lossy().to_string();
+                                        notes.push("Proton prefix");
+                                    }
+
+                                    self.status = if notes.is_empty() {
+                                        "Auto-detect found nothing — fill in paths manually.".to_string()
+                                    } else {
+                                        format!("Auto-detected: {}. Review and Save settings.", notes.join(", "))
+                                    };
+
+                                    if let Err(e) = save_config(&self.cfg) {
+                                        self.status = format!("{} (failed to save: {e})", self.status);
+                                    }
+                                }
+
+                                let clicked = self.gamepad_button(ui, true, Focus::SaveSettings, egui::Button::new("💾 Save settings"));
+                                if clicked {
+                                    match save_config(&self.cfg) {
+                                        Ok(()) => self.status = "Settings saved successfully.".to_string(),
+                                        Err(e) => self.status = format!("Failed to save settings: {e}"),
+                                    }
+                                }
+                            });
+
+                            ui.separator();
+
+                            // --- LOGIN SECTION ---
+                            ui.heading(egui::RichText::new("Epic Games Account").size(20.0).strong());
+                            if self.logged_in {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("✅ Authenticated").color(egui::Color32::LIGHT_GREEN));
+                                    let clicked = self.gamepad_button(ui, true, Focus::SwitchAccount, egui::Button::new("Switch Account"));
+                                    if clicked {
+                                        open_browser(EPIC_LOGIN_URL);
+                                        self.status = "Browser opened. Log in, then paste the authorization code below.".to_string();
+                                        self.logged_in = false;
+                                        self.focus = Some(Focus::CodeField);
+                                    }
+                                });
+                            } else {
+                                let clicked = self.gamepad_button(ui, true, Focus::OpenLogin, egui::Button::new("🔑 Open Epic Login Page"));
+                                if clicked {
+                                    open_browser(EPIC_LOGIN_URL);
+                                    self.status = "Browser opened. Log in, then paste the authorization code below.".to_string();
+                                }
+
+                                ui.horizontal(|ui| {
+                                    let text_edit = egui::TextEdit::singleline(&mut self.auth_code_input)
+                                        .hint_text("Paste 32-character authorization code here")
+                                        .desired_width(ui.available_width() - 120.0);
+
+                                    let response = ui.add(text_edit);
+
+                                    let focused = self.focus == Some(Focus::CodeField);
+
+                                    if focused {
+                                        ui.painter().rect_stroke(
+                                            response.rect.expand(2.0),
+                                            4.0,
+                                            egui::Stroke::new(2.0, egui::Color32::YELLOW),
+                                            egui::StrokeKind::Outside,
+                                        );
+                                    }
+
+                                    let activated = self.gamepad_connected && response.clicked()
+                                        || (focused && std::mem::take(&mut self.select_pressed));
+
+                                    if activated {
+                                        self.ctx
+                                            .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                                    }
+
+                                    if focused && !response.has_focus() {
+                                        for event in ui.input(|i| i.events.clone()) {
+                                            if let egui::Event::Paste(text) = event {
+                                                self.auth_code_input = text.trim().to_owned();
+                                            }
+                                        }
+                                    }
+
+                                    let clicked = self.gamepad_button(ui, true, Focus::SubmitCode, egui::Button::new("Submit Code"));
+                                    if clicked {
+                                        let code = self.auth_code_input.trim().to_string();
+                                        if code.len() != 32 {
+                                            self.status = format!("Authorization code must be 32 characters (got {}).", code.len());
+                                        } else {
+                                            self.busy = true;
+                                            self.status = "Exchanging token...".to_string();
+
+                                            let tx = self.tx.clone();
+                                            let ctx = ctx.clone();
+
+                                            self.rt.spawn(async move {
+                                                let client = reqwest::Client::new();
+                                                let res = exchange_code_for_refresh_token(&client, &code)
+                                                    .await
+                                                    .map_err(|e| e.to_string());
+                                                let _ = tx.send(AppMsg::LoginFinished(res));
+                                                ctx.request_repaint();
+                                            });
+                                        }
+                                    }
+                                });
+                            }
+
+                            ui.separator();
+
+                            // --- UPDATE SECTION ---
+                            ui.heading(egui::RichText::new("Game Updates").size(20.0).strong());
+                            ui.horizontal(|ui| {
+                                let check_label = if self.checking_update { "Checking..." } else { "Check for Updates" };
+                                let enabled = !self.checking_update && !self.updating;
+                                let clicked = self.gamepad_button(ui, enabled, Focus::CheckUpdates, egui::Button::new(check_label));
+                                if clicked {
+                                    self.checking_update = true;
+                                    self.status = "Checking for Rocket League updates via Legendary...".to_string();
+
+                                    let tx = self.tx.clone();
+                                    let ctx = ctx.clone();
+
+                                    self.rt.spawn_blocking(move || {
+                                        let res = updater::check_for_update()
+                                            .map(|status| UpdateCheckResult {
+                                                installed_version: status.installed_version,
+                                                update_available: status.update_available,
+                                            })
+                                            .map_err(|e| e.to_string());
+
+                                        let _ = tx.send(AppMsg::UpdateCheckFinished(res));
+                                        ctx.request_repaint();
+                                    });
+                                }
+
+                                let update_label = if self.updating { "Updating..." } else { "Update Now" };
+                                let enabled = self.update_available && !self.updating;
+                                let clicked = self.gamepad_button(ui, enabled, Focus::UpdateNow, egui::Button::new(update_label));
+                                if clicked {
+                                    self.updating = true;
+                                    self.update_log.clear();
+                                    self.status = "Updating Rocket League via Legendary...".to_string();
+
+                                    let tx = self.tx.clone();
+                                    let ctx = ctx.clone();
+
+                                    std::thread::spawn(move || {
+                                        let result = updater::update_rocket_league(|line| {
+                                            let _ = tx.send(AppMsg::UpdateLogLine(line));
+                                            ctx.request_repaint();
+                                        });
+                                        let _ = tx.send(AppMsg::UpdateFinished(result.map_err(|e| e.to_string())));
+                                        ctx.request_repaint();
+                                    });
+                                }
+                            });
+
+                            if let Some(v) = &self.installed_version {
+                                ui.label(format!("Installed version: {v}"));
+                            }
+
+                            if !self.update_log.is_empty() {
+                                egui::ScrollArea::vertical().max_height(140.0).stick_to_bottom(true).show(ui, |ui| {
+                                    let log_text = self.update_log.join("\n");
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut log_text.as_str())
+                                            .desired_width(f32::INFINITY)
+                                            .font(egui::TextStyle::Monospace)
+                                            .interactive(false)
+                                    );
+                                });
+                            }
+                        });
+                    });
+                },
+            );
+        });
+    }
+}
+
+async fn do_launch(mut cfg: Config) -> Result<(), String> {
     let client = reqwest::Client::new();
     let (creds, new_refresh_token): (LaunchCredentials, String) =
         get_launch_credentials(&client, &cfg.epic_refresh_token)
             .await
             .map_err(|e| e.to_string())?;
 
-    let mut cfg = cfg;
     if new_refresh_token != cfg.epic_refresh_token {
         cfg.epic_refresh_token = new_refresh_token;
         save_config(&cfg).map_err(|e| e.to_string())?;
     }
 
     launch_game(&cfg, &creds, &[]).map_err(|e| e.to_string())
-}
-
-/// Bridges `updater::update_rocket_league` (a blocking function that streams
-/// progress via a plain callback on a background OS thread) into an async
-/// `Stream` of `Message`s that iced's `Task::stream` can drive.
-///
-/// A dedicated OS thread runs the blocking Legendary process and pushes each
-/// output line into a standard `std::sync::mpsc` channel. A second, cheap
-/// blocking-recv loop (spawned once via `spawn_blocking`, not per-line) drains
-/// that channel and forwards each item into a `tokio::sync::mpsc` channel,
-/// which *is* safely awaitable from the async stream body below. This keeps
-/// the blocking work fully off iced's executor while still delivering
-/// progress incrementally instead of all at once at the end.
-fn update_stream() -> impl iced::futures::Stream<Item = Message> {
-    iced::stream::channel(
-        100,
-        |mut output: iced::futures::channel::mpsc::Sender<Message>| async move {
-            let (std_tx, std_rx) = std::sync::mpsc::channel::<UpdateStreamEvent>();
-            let (async_tx, mut async_rx) =
-                tokio::sync::mpsc::unbounded_channel::<UpdateStreamEvent>();
-
-            // Runs Legendary itself; blocking, so it gets its own OS thread.
-            std::thread::spawn(move || {
-                let result = updater::update_rocket_league(|line| {
-                    let _ = std_tx.send(UpdateStreamEvent::Line(line));
-                });
-                let _ = std_tx.send(UpdateStreamEvent::Done(result.map_err(|e| e.to_string())));
-            });
-
-            // Bridges the blocking std channel into the async tokio channel.
-            // `recv()` here blocks a threadpool worker (fine — spawn_blocking is
-            // for exactly this), not iced's own executor thread.
-            tokio::task::spawn_blocking(move || {
-                while let Ok(event) = std_rx.recv() {
-                    let is_done = matches!(event, UpdateStreamEvent::Done(_));
-                    if async_tx.send(event).is_err() || is_done {
-                        break;
-                    }
-                }
-            });
-
-            while let Some(event) = async_rx.recv().await {
-                match event {
-                    UpdateStreamEvent::Line(line) => {
-                        let _ = output.send(Message::UpdateLogLine(line)).await;
-                    }
-                    UpdateStreamEvent::Done(result) => {
-                        let _ = output.send(Message::UpdateFinished(result)).await;
-                        break;
-                    }
-                }
-            }
-        },
-    )
-}
-
-enum UpdateStreamEvent {
-    Line(String),
-    Done(Result<(), String>),
 }

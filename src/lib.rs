@@ -15,6 +15,7 @@
 pub mod auth;
 pub mod config;
 pub mod discovery;
+pub mod gamepad;
 pub mod launch;
 pub mod updater;
 
