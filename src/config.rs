@@ -1,13 +1,13 @@
 // Persistent on-disk configuration for the launcher.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
 const CONFIG_FILE: &str = "config.json";
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     #[serde(default)]
     pub rocket_league_path: String,
@@ -33,11 +33,15 @@ pub struct Config {
 }
 
 pub fn config_path() -> Result<PathBuf> {
-    let exe = std::env::current_exe().context("failed to locate current executable")?;
-    let dir = exe
-        .parent()
-        .ok_or_else(|| anyhow!("executable has no parent dir"))?;
-    Ok(dir.join(CONFIG_FILE))
+    let config_dir = dirs::config_dir()
+        .context("failed to locate config dir")?
+        .join("rocket-launcher");
+
+    if !config_dir.exists() {
+        std::fs::create_dir_all(&config_dir).context("failed to create config dir")?;
+    }
+
+    Ok(config_dir.join(CONFIG_FILE))
 }
 
 pub fn load_config() -> Result<Config> {
@@ -53,6 +57,8 @@ pub fn load_config() -> Result<Config> {
 pub fn save_config(cfg: &Config) -> Result<()> {
     let path = config_path()?;
     let data = serde_json::to_string_pretty(cfg)?;
-    fs::write(path, data).context("failed to write config.json")?;
+    if let Err(err) = fs::write(path, data) {
+        bail!("failed to write config.json: {}", err)
+    }
     Ok(())
 }

@@ -15,7 +15,7 @@ use eframe::egui;
 use gilrs::{Axis, Button, Event, EventType, Gilrs};
 use rocket_launcher::{
     Config, EPIC_LOGIN_URL, LaunchCredentials, discovery, exchange_code_for_refresh_token,
-    gamepad::{Focus, GamepadAction},
+    gamepad::{Direction, Focus, GamepadAction},
     get_launch_credentials, launch_game, load_config, open_browser, save_config, updater,
 };
 use std::sync::{
@@ -23,28 +23,10 @@ use std::sync::{
     mpsc::{self, Receiver, Sender},
 };
 
-// Represents events sent from background async/blocking tasks back to the UI thread.
-enum AppMsg {
-    LoginFinished(Result<String, String>),
-    LaunchFinished(Result<(), String>),
-    UpdateCheckFinished(Result<UpdateCheckResult, String>),
-    UpdateLogLine(String),
-    UpdateFinished(Result<(), String>),
-    Gamepad(GamepadAction),
-    GamepadConnected,
-    GamepadDisconnected,
-}
-
-#[derive(Debug, Clone)]
-struct UpdateCheckResult {
-    installed_version: Option<String>,
-    update_available: bool,
-}
-
 pub fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([600.0, 700.0])
+            .with_fullscreen(true)
             .with_title("Rocket League Launcher"),
         ..Default::default()
     };
@@ -54,6 +36,23 @@ pub fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc.egui_ctx.clone())))),
     )
+}
+
+#[derive(Debug, Clone)]
+struct UpdateCheckResult {
+    installed_version: Option<String>,
+    update_available: bool,
+}
+
+enum AppMsg {
+    LoginFinished(Result<String, String>),
+    LaunchFinished(Result<(), String>),
+    UpdateCheckFinished(Result<UpdateCheckResult, String>),
+    UpdateLogLine(String),
+    UpdateFinished(Result<(), String>),
+    Gamepad(GamepadAction),
+    GamepadConnected,
+    GamepadDisconnected,
 }
 
 struct App {
@@ -69,13 +68,12 @@ struct App {
     updating: bool,
     update_log: Vec<String>,
     background: egui::TextureHandle,
+    scale: f32,
 
-    // Gamepad
     gamepad_connected: bool,
     focus: Option<Focus>,
     select_pressed: bool,
 
-    // Threading / async interop
     rt: Arc<tokio::runtime::Runtime>,
     tx: Sender<AppMsg>,
     rx: Receiver<AppMsg>,
@@ -83,7 +81,7 @@ struct App {
 
 impl App {
     fn new(ctx: egui::Context) -> Self {
-        let cfg = load_config().unwrap_or_default();
+        let mut cfg = load_config().unwrap_or_default();
         let logged_in = !cfg.epic_refresh_token.trim().is_empty();
         let (tx, rx) = mpsc::channel();
         let gilrs_tx = tx.clone();
@@ -180,15 +178,51 @@ impl App {
             Default::default(),
         );
 
+        let screen = ctx.input(|i| i.content_rect());
+        let shortest = screen.width().min(screen.height());
+        let scale = (shortest / 1080.0).clamp(1.0, 2.0);
+        let mut status = if logged_in {
+            "Ready. Session loaded from config.json.".to_string()
+        } else {
+            "Not logged in yet.".to_string()
+        };
+
+        if cfg == Default::default() {
+            let found = discovery::discover_all();
+            let mut notes = Vec::new();
+
+            if let Some(p) = found.rocket_league_path {
+                cfg.rocket_league_path = p.to_string_lossy().to_string();
+                notes.push("RL exe");
+            }
+            if let Some(p) = found.steam_install_path {
+                cfg.steam_install_path = p.to_string_lossy().to_string();
+                notes.push("Steam install");
+            }
+            if let Some(p) = found.proton_path {
+                cfg.proton_path = p.to_string_lossy().to_string();
+                notes.push("Proton");
+            }
+            if let Some(p) = found.compat_data_path {
+                cfg.compat_data_path = p.to_string_lossy().to_string();
+                notes.push("Proton prefix");
+            }
+
+            status = if notes.is_empty() {
+                "Auto-detect found nothing — fill in paths manually.".to_string()
+            } else {
+                format!(
+                    "Auto-detected: {}. Review and Save settings.",
+                    notes.join(", ")
+                )
+            };
+        }
+
         Self {
             cfg,
             ctx,
             auth_code_input: String::new(),
-            status: if logged_in {
-                "Ready. Session loaded from config.json.".to_string()
-            } else {
-                "Not logged in yet.".to_string()
-            },
+            status,
             busy: false,
             logged_in,
 
@@ -198,6 +232,7 @@ impl App {
             updating: false,
             update_log: Vec::new(),
             background: bg_texture,
+            scale,
 
             gamepad_connected: false,
             focus: None,
@@ -230,14 +265,24 @@ impl App {
                         self.focus = Some(Focus::AutoDetect);
                     }
                     match action {
-                        GamepadAction::Up | GamepadAction::Left => {
+                        GamepadAction::Up => {
                             if let Some(focus) = self.focus {
-                                self.focus = Some(focus.previous(self.logged_in));
+                                self.focus = Some(focus.navigate(Direction::Up, self.logged_in));
                             }
                         }
-                        GamepadAction::Down | GamepadAction::Right => {
+                        GamepadAction::Down => {
                             if let Some(focus) = self.focus {
-                                self.focus = Some(focus.next(self.logged_in));
+                                self.focus = Some(focus.navigate(Direction::Down, self.logged_in));
+                            }
+                        }
+                        GamepadAction::Left => {
+                            if let Some(focus) = self.focus {
+                                self.focus = Some(focus.navigate(Direction::Left, self.logged_in));
+                            }
+                        }
+                        GamepadAction::Right => {
+                            if let Some(focus) = self.focus {
+                                self.focus = Some(focus.navigate(Direction::Right, self.logged_in));
                             }
                         }
                         GamepadAction::Select => {
@@ -354,6 +399,41 @@ impl App {
         response.clicked()
             || (enabled && Some(focus) == self.focus && std::mem::take(&mut self.select_pressed))
     }
+
+    fn auto_detect_paths(&mut self) {
+        let found = discovery::discover_all();
+        let mut notes = Vec::new();
+
+        if let Some(p) = found.rocket_league_path {
+            self.cfg.rocket_league_path = p.to_string_lossy().to_string();
+            notes.push("RL exe");
+        }
+        if let Some(p) = found.steam_install_path {
+            self.cfg.steam_install_path = p.to_string_lossy().to_string();
+            notes.push("Steam install");
+        }
+        if let Some(p) = found.proton_path {
+            self.cfg.proton_path = p.to_string_lossy().to_string();
+            notes.push("Proton");
+        }
+        if let Some(p) = found.compat_data_path {
+            self.cfg.compat_data_path = p.to_string_lossy().to_string();
+            notes.push("Proton prefix");
+        }
+
+        self.status = if notes.is_empty() {
+            "Auto-detect found nothing — fill in paths manually.".to_string()
+        } else {
+            format!(
+                "Auto-detected: {}. Review and Save settings.",
+                notes.join(", ")
+            )
+        };
+
+        if let Err(e) = save_config(&self.cfg) {
+            self.status = format!("{} (failed to save: {e})", self.status);
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -363,8 +443,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
 
         // 2. FULL-SCREEN OPTIMIZATIONS
-        // Globally scale everything up by 35% for readability in full screen
-        ctx.set_pixels_per_point(1.35);
+        ctx.set_pixels_per_point(self.scale);
 
         // Increase spacing between elements and add chunkier padding to buttons
         ui.spacing_mut().item_spacing = egui::vec2(0.0, 16.0);
@@ -403,69 +482,142 @@ impl eframe::App for App {
 
         // 4. CENTERED CONTAINER LAYOUT
         // Locks the UI width to a clean bounding box centered on screen
-        let available_height = ui.available_height();
+        let available_width = ui.available_width();
+        let container_width = available_width.min(1000.0);
 
-        ui.horizontal(|ui| {
-            let total_width = ui.available_width();
-            let container_width = total_width.min(1000.0);
+        ui.with_layout(
+            egui::Layout::top_down(egui::Align::Center).with_main_align(egui::Align::Center).with_cross_align(egui::Align::Center),
+            |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_black_alpha(200))
+                .outer_margin(24.)
+                .inner_margin(24.)
+                .corner_radius(12.)
+                .show(ui, |ui| {
+                    ui.set_width(container_width - 48.0);
 
-            // Calculate the exact spacer needed on the left to keep us dead center
-            let spacer_width = (total_width - container_width) / 2.0;
-            ui.add_space(spacer_width);
+                    // --- LAUNCH SECTION ---
+                    ui.horizontal(|ui| {
+                        ui.columns(3, |cols| {
+                            cols[0].vertical(|ui| {
+                                ui.heading("Rocket Launcher");
 
-            ui.allocate_ui_with_layout(
-                egui::vec2(container_width, available_height),
-                egui::Layout::top_down(egui::Align::LEFT),
-                |ui| {
-                egui::Frame::new()
-                    .fill(egui::Color32::from_black_alpha(200))
-                    .outer_margin(24.)
-                    .inner_margin(24.)
-                    .corner_radius(12.)
-                    .show(ui, |ui| {
-                        // --- LAUNCH SECTION ---
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(ui.available_width(), 0.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                let response = ui.add(egui::Checkbox::new(
-                                    &mut self.cfg.skip_eac,
-                                    "Skip Easy Anti-Cheat (offline modes only)"
-                                ));
+                                ui.horizontal(|ui| {
+                                    let check_label = if self.checking_update { "Checking..." } else { "Check for Updates" };
+                                    let enabled = !self.checking_update && !self.updating;
+                                    let clicked = self.gamepad_button(ui, enabled, Focus::CheckUpdates, egui::Button::new(check_label));
+                                    if clicked {
+                                        self.checking_update = true;
+                                        self.status = "Checking for Rocket League updates via Legendary...".to_string();
 
-                                if Some(Focus::SkipEasyAntiCheat) == self.focus {
-                                    ui.painter().rect_stroke(
-                                        response.rect.expand(2.0),
-                                        4.0,
-                                        egui::Stroke::new(2.0, egui::Color32::YELLOW),
-                                        egui::StrokeKind::Outside,
-                                    );
+                                        let tx = self.tx.clone();
+                                        let ctx = ctx.clone();
+
+                                        self.rt.spawn_blocking(move || {
+                                            let res = updater::check_for_update()
+                                                .map(|status| UpdateCheckResult {
+                                                    installed_version: status.installed_version,
+                                                    update_available: status.update_available,
+                                                })
+                                                .map_err(|e| e.to_string());
+
+                                            let _ = tx.send(AppMsg::UpdateCheckFinished(res));
+                                            ctx.request_repaint();
+                                        });
+                                    }
+
+                                    ui.add_space(10.);
+
+                                    let update_label = if self.updating { "Updating..." } else { "Update Now" };
+                                    let enabled = self.update_available && !self.updating;
+                                    let clicked = self.gamepad_button(ui, enabled, Focus::UpdateNow, egui::Button::new(update_label));
+                                    if clicked {
+                                        self.updating = true;
+                                        self.update_log.clear();
+                                        self.status = "Updating Rocket League via Legendary...".to_string();
+
+                                        let tx = self.tx.clone();
+                                        let ctx = ctx.clone();
+
+                                        std::thread::spawn(move || {
+                                            let result = updater::update_rocket_league(|line| {
+                                                let _ = tx.send(AppMsg::UpdateLogLine(line));
+                                                ctx.request_repaint();
+                                            });
+                                            let _ = tx.send(AppMsg::UpdateFinished(result.map_err(|e| e.to_string())));
+                                            ctx.request_repaint();
+                                        });
+                                    }
+                                });
+
+                                if let Some(v) = &self.installed_version {
+                                    ui.label(format!("Installed version: {v}"));
                                 }
 
-                                let gamepad_activated = Some(Focus::SkipEasyAntiCheat) == self.focus && std::mem::take(&mut self.select_pressed);
-                                if gamepad_activated {
-                                    self.cfg.skip_eac = !self.cfg.skip_eac;
+                                if !self.update_log.is_empty() {
+                                    egui::ScrollArea::vertical().max_height(140.0).stick_to_bottom(true).show(ui, |ui| {
+                                        let log_text = self.update_log.join("\n");
+                                        ui.add(
+                                            egui::TextEdit::multiline(&mut log_text.as_str())
+                                                .desired_width(f32::INFINITY)
+                                                .font(egui::TextStyle::Monospace)
+                                                .interactive(false)
+                                        );
+                                    });
                                 }
-                                if response.clicked() || gamepad_activated {
-                                    if let Err(e) = save_config(&self.cfg) {
-                                        self.status = format!("{} (failed to save: {e})", self.status);
+                            });
+                            cols[1].vertical(|ui| {
+                                ui.heading("Epic Games Account");
+                                if self.logged_in {
+                                    ui.horizontal(|ui| {
+                                        let clicked = self.gamepad_button(ui, true, Focus::SwitchAccount, egui::Button::new("Switch Account"));
+                                        if clicked {
+                                            open_browser(EPIC_LOGIN_URL);
+                                            self.status = "Browser opened. Log in, then paste the authorization code below.".to_string();
+                                            self.logged_in = false;
+                                            self.focus = Some(Focus::CodeField);
+                                        }
+                                        ui.add_space(10.);
+                                        ui.label(egui::RichText::new("✅ Authenticated").color(egui::Color32::LIGHT_GREEN));
+                                    });
+                                } else {
+                                    let clicked = self.gamepad_button(ui, true, Focus::OpenLogin, egui::Button::new("🔑 Open Epic Login Page"));
+                                    if clicked {
+                                        open_browser(EPIC_LOGIN_URL);
+                                        self.status = "Browser opened. Log in, then paste the authorization code below.".to_string();
                                     }
                                 }
+                            });
+                            cols[2].horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    let launch_label = if self.busy {
+                                        "Working..."
+                                    } else {
+                                        "🚀 LAUNCH ROCKET LEAGUE"
+                                    };
 
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    let launch_label = if self.busy { "Working..." } else { "🚀 LAUNCH ROCKET LEAGUE" };
                                     let enabled = self.logged_in && !self.busy;
-                                    let launch_btn = egui::Button::new(egui::RichText::new(launch_label).size(18.0).strong())
-                                        .fill(egui::Color32::from_rgb(0, 102, 204));
 
-                                    let clicked = self.gamepad_button(ui, enabled, Focus::Launch, launch_btn);
+                                    let launch_btn = egui::Button::new(
+                                        egui::RichText::new(launch_label)
+                                            .size(18.0)
+                                            .strong(),
+                                    )
+                                    .fill(egui::Color32::from_rgb(0, 102, 204));
+
+                                    let clicked =
+                                        self.gamepad_button(ui, enabled, Focus::Launch, launch_btn);
 
                                     if clicked {
                                         if self.cfg.rocket_league_path.trim().is_empty() {
-                                            self.status = "Set the Rocket League executable path first.".to_string();
+                                            self.status =
+                                                "Set the Rocket League executable path first."
+                                                    .to_string();
                                         } else {
                                             self.busy = true;
-                                            self.status = "Authenticating with Epic Games...".to_string();
+                                            self.status =
+                                                "Authenticating with Epic Games..."
+                                                    .to_string();
 
                                             let cfg = self.cfg.clone();
                                             let tx = self.tx.clone();
@@ -478,115 +630,13 @@ impl eframe::App for App {
                                             });
                                         }
                                     }
-                                });
-                            }
-                        );
 
-                        ui.separator();
+                                    let response = ui.add(egui::Checkbox::new(
+                                        &mut self.cfg.skip_eac,
+                                        "Skip Easy Anti-Cheat (offline modes only)",
+                                    ));
 
-                        ui.label(egui::RichText::new(&self.status).size(14.0).italics());
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            // --- SETTINGS SECTION ---
-                            ui.heading(egui::RichText::new("Launcher Settings").size(24.0).strong());
-                            ui.add_space(4.0);
-
-                            egui::Grid::new("settings_grid")
-                                .num_columns(2)
-                                .spacing([20.0, 14.0])
-                                .min_row_height(32.0)
-                                .show(ui, |ui| {
-                                    ui.label(egui::RichText::new("Rocket League Executable:").size(15.0));
-                                    ui.add(egui::TextEdit::singleline(&mut self.cfg.rocket_league_path).desired_width(f32::INFINITY));
-                                    ui.end_row();
-
-                                    ui.label(egui::RichText::new("Proton Binary Path:").size(15.0));
-                                    ui.add(egui::TextEdit::singleline(&mut self.cfg.proton_path).desired_width(f32::INFINITY));
-                                    ui.end_row();
-
-                                    ui.label(egui::RichText::new("Compat Data Prefix:").size(15.0));
-                                    ui.add(egui::TextEdit::singleline(&mut self.cfg.compat_data_path).desired_width(f32::INFINITY));
-                                    ui.end_row();
-
-                                    ui.label(egui::RichText::new("Steam Install Path:").size(15.0));
-                                    ui.add(egui::TextEdit::singleline(&mut self.cfg.steam_install_path).desired_width(f32::INFINITY));
-                                    ui.end_row();
-                                });
-
-                            ui.horizontal(|ui| {
-                                let clicked = self.gamepad_button(ui, true, Focus::AutoDetect, egui::Button::new("🔄 Auto-detect paths"));
-                                if clicked {
-                                    let found = discovery::discover_all();
-                                    let mut notes = Vec::new();
-
-                                    if let Some(p) = found.rocket_league_path {
-                                        self.cfg.rocket_league_path = p.to_string_lossy().to_string();
-                                        notes.push("RL exe");
-                                    }
-                                    if let Some(p) = found.steam_install_path {
-                                        self.cfg.steam_install_path = p.to_string_lossy().to_string();
-                                        notes.push("Steam install");
-                                    }
-                                    if let Some(p) = found.proton_path {
-                                        self.cfg.proton_path = p.to_string_lossy().to_string();
-                                        notes.push("Proton");
-                                    }
-                                    if let Some(p) = found.compat_data_path {
-                                        self.cfg.compat_data_path = p.to_string_lossy().to_string();
-                                        notes.push("Proton prefix");
-                                    }
-
-                                    self.status = if notes.is_empty() {
-                                        "Auto-detect found nothing — fill in paths manually.".to_string()
-                                    } else {
-                                        format!("Auto-detected: {}. Review and Save settings.", notes.join(", "))
-                                    };
-
-                                    if let Err(e) = save_config(&self.cfg) {
-                                        self.status = format!("{} (failed to save: {e})", self.status);
-                                    }
-                                }
-
-                                let clicked = self.gamepad_button(ui, true, Focus::SaveSettings, egui::Button::new("💾 Save settings"));
-                                if clicked {
-                                    match save_config(&self.cfg) {
-                                        Ok(()) => self.status = "Settings saved successfully.".to_string(),
-                                        Err(e) => self.status = format!("Failed to save settings: {e}"),
-                                    }
-                                }
-                            });
-
-                            ui.separator();
-
-                            // --- LOGIN SECTION ---
-                            ui.heading(egui::RichText::new("Epic Games Account").size(20.0).strong());
-                            if self.logged_in {
-                                ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("✅ Authenticated").color(egui::Color32::LIGHT_GREEN));
-                                    let clicked = self.gamepad_button(ui, true, Focus::SwitchAccount, egui::Button::new("Switch Account"));
-                                    if clicked {
-                                        open_browser(EPIC_LOGIN_URL);
-                                        self.status = "Browser opened. Log in, then paste the authorization code below.".to_string();
-                                        self.logged_in = false;
-                                        self.focus = Some(Focus::CodeField);
-                                    }
-                                });
-                            } else {
-                                let clicked = self.gamepad_button(ui, true, Focus::OpenLogin, egui::Button::new("🔑 Open Epic Login Page"));
-                                if clicked {
-                                    open_browser(EPIC_LOGIN_URL);
-                                    self.status = "Browser opened. Log in, then paste the authorization code below.".to_string();
-                                }
-
-                                ui.horizontal(|ui| {
-                                    let text_edit = egui::TextEdit::singleline(&mut self.auth_code_input)
-                                        .hint_text("Paste 32-character authorization code here")
-                                        .desired_width(ui.available_width() - 120.0);
-
-                                    let response = ui.add(text_edit);
-
-                                    let focused = self.focus == Some(Focus::CodeField);
-
-                                    if focused {
+                                    if Some(Focus::SkipEasyAntiCheat) == self.focus {
                                         ui.painter().rect_stroke(
                                             response.rect.expand(2.0),
                                             4.0,
@@ -595,116 +645,139 @@ impl eframe::App for App {
                                         );
                                     }
 
-                                    let activated = self.gamepad_connected && response.clicked()
-                                        || (focused && std::mem::take(&mut self.select_pressed));
+                                    let gamepad_activated =
+                                        Some(Focus::SkipEasyAntiCheat) == self.focus
+                                            && std::mem::take(&mut self.select_pressed);
 
-                                    if activated {
-                                        self.ctx
-                                            .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                                    if gamepad_activated {
+                                        self.cfg.skip_eac = !self.cfg.skip_eac;
                                     }
 
-                                    if focused && !response.has_focus() {
-                                        for event in ui.input(|i| i.events.clone()) {
-                                            if let egui::Event::Paste(text) = event {
-                                                self.auth_code_input = text.trim().to_owned();
-                                            }
-                                        }
-                                    }
-
-                                    let clicked = self.gamepad_button(ui, true, Focus::SubmitCode, egui::Button::new("Submit Code"));
-                                    if clicked {
-                                        let code = self.auth_code_input.trim().to_string();
-                                        if code.len() != 32 {
-                                            self.status = format!("Authorization code must be 32 characters (got {}).", code.len());
-                                        } else {
-                                            self.busy = true;
-                                            self.status = "Exchanging token...".to_string();
-
-                                            let tx = self.tx.clone();
-                                            let ctx = ctx.clone();
-
-                                            self.rt.spawn(async move {
-                                                let client = reqwest::Client::new();
-                                                let res = exchange_code_for_refresh_token(&client, &code)
-                                                    .await
-                                                    .map_err(|e| e.to_string());
-                                                let _ = tx.send(AppMsg::LoginFinished(res));
-                                                ctx.request_repaint();
-                                            });
+                                    if response.clicked() || gamepad_activated {
+                                        if let Err(e) = save_config(&self.cfg) {
+                                            self.status = format!(
+                                                "{} (failed to save: {e})",
+                                                self.status
+                                            );
                                         }
                                     }
                                 });
+                            });
+                        });
+                    });
+
+
+                    if !self.logged_in {
+                        ui.separator();
+
+                        ui.horizontal(|ui| {
+                            let text_edit = egui::TextEdit::singleline(&mut self.auth_code_input)
+                                .hint_text("Paste 32-character authorization code here")
+                                .desired_width(ui.available_width() - 120.0);
+
+                            let response = ui.add(text_edit);
+
+                            let focused = self.focus == Some(Focus::CodeField);
+
+                            if focused {
+                                ui.painter().rect_stroke(
+                                    response.rect.expand(2.0),
+                                    4.0,
+                                    egui::Stroke::new(2.0, egui::Color32::YELLOW),
+                                    egui::StrokeKind::Outside,
+                                );
                             }
 
-                            ui.separator();
+                            let activated = self.gamepad_connected && response.clicked()
+                                || (focused && std::mem::take(&mut self.select_pressed));
 
-                            // --- UPDATE SECTION ---
-                            ui.heading(egui::RichText::new("Game Updates").size(20.0).strong());
-                            ui.horizontal(|ui| {
-                                let check_label = if self.checking_update { "Checking..." } else { "Check for Updates" };
-                                let enabled = !self.checking_update && !self.updating;
-                                let clicked = self.gamepad_button(ui, enabled, Focus::CheckUpdates, egui::Button::new(check_label));
-                                if clicked {
-                                    self.checking_update = true;
-                                    self.status = "Checking for Rocket League updates via Legendary...".to_string();
+                            if activated {
+                                self.ctx
+                                    .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                            }
+
+                            if focused && !response.has_focus() {
+                                for event in ui.input(|i| i.events.clone()) {
+                                    if let egui::Event::Paste(text) = event {
+                                        self.auth_code_input = text.trim().to_owned();
+                                    }
+                                }
+                            }
+
+                            ui.add_space(10.);
+
+                            let clicked = self.gamepad_button(ui, true, Focus::SubmitCode, egui::Button::new("Submit Code"));
+                            if clicked {
+                                let code = self.auth_code_input.trim().to_string();
+                                if code.len() != 32 {
+                                    self.status = format!("Authorization code must be 32 characters (got {}).", code.len());
+                                } else {
+                                    self.busy = true;
+                                    self.status = "Exchanging token...".to_string();
 
                                     let tx = self.tx.clone();
                                     let ctx = ctx.clone();
 
-                                    self.rt.spawn_blocking(move || {
-                                        let res = updater::check_for_update()
-                                            .map(|status| UpdateCheckResult {
-                                                installed_version: status.installed_version,
-                                                update_available: status.update_available,
-                                            })
+                                    self.rt.spawn(async move {
+                                        let client = reqwest::Client::new();
+                                        let res = exchange_code_for_refresh_token(&client, &code)
+                                            .await
                                             .map_err(|e| e.to_string());
-
-                                        let _ = tx.send(AppMsg::UpdateCheckFinished(res));
+                                        let _ = tx.send(AppMsg::LoginFinished(res));
                                         ctx.request_repaint();
                                     });
                                 }
+                            }
+                        });
+                    }
 
-                                let update_label = if self.updating { "Updating..." } else { "Update Now" };
-                                let enabled = self.update_available && !self.updating;
-                                let clicked = self.gamepad_button(ui, enabled, Focus::UpdateNow, egui::Button::new(update_label));
-                                if clicked {
-                                    self.updating = true;
-                                    self.update_log.clear();
-                                    self.status = "Updating Rocket League via Legendary...".to_string();
+                    ui.separator();
 
-                                    let tx = self.tx.clone();
-                                    let ctx = ctx.clone();
+                    ui.label(egui::RichText::new(&self.status).size(14.0).italics());
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        // --- SETTINGS SECTION ---
+                        ui.heading(egui::RichText::new("Launcher Settings").size(24.0).strong());
+                        ui.add_space(4.0);
 
-                                    std::thread::spawn(move || {
-                                        let result = updater::update_rocket_league(|line| {
-                                            let _ = tx.send(AppMsg::UpdateLogLine(line));
-                                            ctx.request_repaint();
-                                        });
-                                        let _ = tx.send(AppMsg::UpdateFinished(result.map_err(|e| e.to_string())));
-                                        ctx.request_repaint();
-                                    });
-                                }
+                        egui::Grid::new("settings_grid")
+                            .num_columns(2)
+                            .spacing([20.0, 14.0])
+                            .min_row_height(32.0)
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new("Rocket League Executable:").size(15.0));
+                                ui.add(egui::TextEdit::singleline(&mut self.cfg.rocket_league_path).desired_width(f32::INFINITY));
+                                ui.end_row();
+
+                                ui.label(egui::RichText::new("Proton Binary Path:").size(15.0));
+                                ui.add(egui::TextEdit::singleline(&mut self.cfg.proton_path).desired_width(f32::INFINITY));
+                                ui.end_row();
+
+                                ui.label(egui::RichText::new("Compat Data Prefix:").size(15.0));
+                                ui.add(egui::TextEdit::singleline(&mut self.cfg.compat_data_path).desired_width(f32::INFINITY));
+                                ui.end_row();
+
+                                ui.label(egui::RichText::new("Steam Install Path:").size(15.0));
+                                ui.add(egui::TextEdit::singleline(&mut self.cfg.steam_install_path).desired_width(f32::INFINITY));
+                                ui.end_row();
                             });
 
-                            if let Some(v) = &self.installed_version {
-                                ui.label(format!("Installed version: {v}"));
+                        ui.horizontal(|ui| {
+                            let clicked = self.gamepad_button(ui, true, Focus::AutoDetect, egui::Button::new("🔄 Auto-detect paths"));
+                            if clicked {
+                                self.auto_detect_paths();
                             }
 
-                            if !self.update_log.is_empty() {
-                                egui::ScrollArea::vertical().max_height(140.0).stick_to_bottom(true).show(ui, |ui| {
-                                    let log_text = self.update_log.join("\n");
-                                    ui.add(
-                                        egui::TextEdit::multiline(&mut log_text.as_str())
-                                            .desired_width(f32::INFINITY)
-                                            .font(egui::TextStyle::Monospace)
-                                            .interactive(false)
-                                    );
-                                });
+                            ui.add_space(10.);
+                            let clicked = self.gamepad_button(ui, true, Focus::SaveSettings, egui::Button::new("💾 Save settings"));
+                            if clicked {
+                                match save_config(&self.cfg) {
+                                    Ok(()) => self.status = "Settings saved successfully.".to_string(),
+                                    Err(e) => self.status = format!("Failed to save settings: {e}"),
+                                }
                             }
                         });
                     });
-                },
-            );
+                });
         });
     }
 }
