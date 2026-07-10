@@ -39,6 +39,7 @@ pub enum Message {
     ToggleAdvancedSettings,
 
     // Async completions
+    AutoDetectPaths,
     LoginFinished(Result<String, String>),
     LaunchFinished(Result<(), String>),
     UpdateCheckFinished(Result<UpdateCheckResult, String>),

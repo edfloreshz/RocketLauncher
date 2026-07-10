@@ -22,10 +22,6 @@ pub async fn do_launch(mut cfg: Config) -> Result<(), String> {
     launch_game(&cfg, &creds, &[]).map_err(|e| e.to_string())
 }
 
-/// Long-lived subscription stream that owns the gilrs context on a blocking
-/// thread and forwards pad events into Iced's message loop. This is the
-/// Subscription-based replacement for the egui version's
-/// `std::thread::spawn` + `mpsc::Sender<AppMsg>` + `ctx.request_repaint()`.
 pub fn gamepad_worker() -> impl iced::futures::Stream<Item = Message> {
     stream::channel(
         100,

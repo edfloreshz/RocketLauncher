@@ -12,91 +12,92 @@ use rocket_launcher_core::{
 use crate::types::{Message, UpdateCheckResult, UpdateEvent};
 use crate::worker::{do_launch, gamepad_worker};
 
+#[derive(Debug, Clone)]
 pub struct App {
-    pub cfg: Config,
-    pub auth_code_input: String,
-    pub status: String,
+    pub state: AppState,
+    pub auth: AuthState,
+    pub updates: Updates,
+    pub gamepad: GamepadState,
+    pub config: Config,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppState {
     pub busy: bool,
-    pub logged_in: bool,
-    pub checking_update: bool,
-    pub update_available: bool,
-    pub installed_version: Option<String>,
-    pub updating: bool,
-    pub update_log: Vec<String>,
+    pub status: String,
     pub background: image::Handle,
-    pub gamepad_connected: bool,
-    pub focus: Option<Focus>,
     pub window_id: iced::window::Id,
     pub window_focused: bool,
     pub show_advanced_settings: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct AuthState {
+    pub logged_in: bool,
+    pub auth_code_input: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Updates {
+    pub log: Vec<String>,
+    pub installed_version: Option<String>,
+    pub state: UpdateState,
+}
+
+#[derive(Debug, Clone)]
+pub struct GamepadState {
+    pub connected: bool,
+    pub focus: Option<Focus>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpdateState {
+    Idle,
+    CheckingUpdate,
+    UpdateAvailable,
+    Updating,
+}
+
 impl App {
     pub fn new() -> (Self, Task<Message>) {
-        let mut cfg = load_config().unwrap_or_default();
-        let logged_in = !cfg.epic_refresh_token.trim().is_empty();
-
-        let mut status = if logged_in {
+        let config = load_config().unwrap_or_default();
+        let logged_in = !config.epic_refresh_token.trim().is_empty();
+        let status = if logged_in {
             "Ready. Session loaded from config.json.".to_string()
         } else {
             "Not logged in yet.".to_string()
         };
 
-        // Auto-detect on first run, same as the egui version.
-        if cfg == Config::default() {
-            let found = discovery::discover_all();
-            let mut notes = Vec::new();
-
-            if let Some(p) = found.rocket_league_path {
-                cfg.rocket_league_path = p.to_string_lossy().to_string();
-                notes.push("RL exe");
-            }
-            if let Some(p) = found.steam_install_path {
-                cfg.steam_install_path = p.to_string_lossy().to_string();
-                notes.push("Steam install");
-            }
-            if let Some(p) = found.proton_path {
-                cfg.proton_path = p.to_string_lossy().to_string();
-                notes.push("Proton");
-            }
-            if let Some(p) = found.compat_data_path {
-                cfg.compat_data_path = p.to_string_lossy().to_string();
-                notes.push("Proton prefix");
-            }
-
-            status = if notes.is_empty() {
-                "Auto-detect found nothing — fill in paths manually.".to_string()
-            } else {
-                format!(
-                    "Auto-detected: {}. Review and Save settings.",
-                    notes.join(", ")
-                )
-            };
-        }
-
-        let background =
-            image::Handle::from_bytes(include_bytes!("../assets/background.jpg").as_slice());
-
-        (
-            Self {
-                cfg,
-                auth_code_input: String::new(),
-                status,
+        let mut app = Self {
+            state: AppState {
                 busy: false,
-                logged_in,
-                checking_update: false,
-                update_available: false,
-                installed_version: None,
-                updating: false,
-                update_log: Vec::new(),
-                background,
-                gamepad_connected: false,
-                focus: None,
-                window_focused: false,
+                status,
+                background: image::Handle::from_bytes(
+                    include_bytes!("../assets/background.jpg").as_slice(),
+                ),
                 window_id: iced::window::Id::unique(),
+                window_focused: false,
                 show_advanced_settings: false,
             },
-            Task::none(),
+            auth: AuthState {
+                logged_in,
+                auth_code_input: String::new(),
+            },
+            updates: Updates {
+                log: Vec::new(),
+                installed_version: None,
+                state: UpdateState::Idle,
+            },
+            gamepad: GamepadState {
+                connected: false,
+                focus: None,
+            },
+            config,
+        };
+
+        (
+            app.clone(),
+            Task::batch(vec![app.update(Message::AutoDetectPaths)]),
         )
     }
 
@@ -108,93 +109,119 @@ impl App {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::ToggleAdvancedSettings => {
-                self.show_advanced_settings = !self.show_advanced_settings;
-                Task::none()
-            }
-            Message::ExitPressed => iced::window::close(self.window_id),
+            Message::ExitPressed => iced::window::close(self.state.window_id),
             Message::Window(id, iced::window::Event::Focused) => {
-                self.window_id = id;
-                self.window_focused = true;
+                self.state.window_id = id;
+                self.state.window_focused = true;
                 Task::none()
             }
             Message::Window(_, iced::window::Event::Unfocused) => {
-                self.window_focused = false;
+                self.state.window_focused = false;
                 Task::none()
             }
             Message::Window(_, _) => Task::none(),
+            Message::ToggleAdvancedSettings => {
+                self.state.show_advanced_settings = !self.state.show_advanced_settings;
+                Task::none()
+            }
             Message::RocketLeaguePathChanged(v) => {
-                self.cfg.rocket_league_path = v;
+                self.config.rocket_league_path = v;
                 Task::none()
             }
             Message::ProtonPathChanged(v) => {
-                self.cfg.proton_path = v;
+                self.config.proton_path = v;
                 Task::none()
             }
             Message::CompatDataPathChanged(v) => {
-                self.cfg.compat_data_path = v;
+                self.config.compat_data_path = v;
                 Task::none()
             }
             Message::SteamInstallPathChanged(v) => {
-                self.cfg.steam_install_path = v;
+                self.config.steam_install_path = v;
                 Task::none()
             }
             Message::SkipEacToggled(v) => {
-                self.cfg.skip_eac = v;
-                if let Err(e) = save_config(&self.cfg) {
-                    self.status = format!("{} (failed to save: {e})", self.status);
+                self.config.skip_eac = v;
+                if let Err(e) = save_config(&self.config) {
+                    self.state.status = format!("{} (failed to save: {e})", self.state.status);
                 }
                 Task::none()
             }
             Message::ThemeSelected(theme) => {
-                self.cfg.theme = theme.to_string();
-                if let Err(e) = save_config(&self.cfg) {
-                    self.status = format!("{} (failed to save: {e})", self.status);
+                self.config.theme = theme.to_string();
+                if let Err(e) = save_config(&self.config) {
+                    self.state.status = format!("{} (failed to save: {e})", self.state.status);
                 }
                 Task::none()
             }
-
+            Message::AutoDetectPaths => {
+                if self.config == Config::default() {
+                    let (_, notes) = Self::auto_detect_paths(&mut self.config);
+                    self.state.status = if notes.is_empty() {
+                        "Auto-detect found nothing — fill in paths manually.".to_string()
+                    } else {
+                        format!(
+                            "Auto-detected: {}. Review and Save settings.",
+                            notes.join(", ")
+                        )
+                    };
+                }
+                Task::none()
+            }
             Message::AutoDetectPressed => {
-                self.auto_detect_paths();
+                let (config, notes) = Self::auto_detect_paths(&mut self.config);
+
+                self.state.status = if notes.is_empty() {
+                    "Auto-detect found nothing — fill in paths manually.".to_string()
+                } else {
+                    format!(
+                        "Auto-detected: {}. Review and Save settings.",
+                        notes.join(", ")
+                    )
+                };
+
+                if let Err(e) = save_config(&config) {
+                    self.state.status = format!("{} (failed to save: {e})", self.state.status);
+                }
                 Task::none()
             }
             Message::SaveSettingsPressed => {
-                match save_config(&self.cfg) {
-                    Ok(()) => self.status = "Settings saved successfully.".to_string(),
-                    Err(e) => self.status = format!("Failed to save settings: {e}"),
+                match save_config(&self.config) {
+                    Ok(()) => self.state.status = "Settings saved successfully.".to_string(),
+                    Err(e) => self.state.status = format!("Failed to save settings: {e}"),
                 }
                 Task::none()
             }
 
             Message::OpenLoginPressed => {
                 open_browser(EPIC_LOGIN_URL);
-                self.status =
+                self.state.status =
                     "Browser opened. Log in, then paste the authorization code below.".to_string();
                 Task::none()
             }
             Message::SwitchAccountPressed => {
                 open_browser(EPIC_LOGIN_URL);
-                self.status =
+                self.state.status =
                     "Browser opened. Log in, then paste the authorization code below.".to_string();
-                self.logged_in = false;
-                self.focus = Some(Focus::CodeField);
+                self.auth.logged_in = false;
+                self.gamepad.focus = Some(Focus::CodeField);
                 Task::none()
             }
             Message::AuthCodeChanged(v) => {
-                self.auth_code_input = v;
+                self.auth.auth_code_input = v;
                 Task::none()
             }
             Message::SubmitCodePressed => {
-                let code = self.auth_code_input.trim().to_string();
+                let code = self.auth.auth_code_input.trim().to_string();
                 if code.len() != 32 {
-                    self.status = format!(
+                    self.state.status = format!(
                         "Authorization code must be 32 characters (got {}).",
                         code.len()
                     );
                     Task::none()
                 } else {
-                    self.busy = true;
-                    self.status = "Exchanging token...".to_string();
+                    self.state.busy = true;
+                    self.state.status = "Exchanging token...".to_string();
                     Task::perform(
                         async move {
                             let client = reqwest::Client::new();
@@ -208,53 +235,57 @@ impl App {
             }
 
             Message::LoginFinished(result) => {
-                self.busy = false;
+                self.state.busy = false;
                 match result {
                     Ok(refresh_token) => {
-                        self.cfg.epic_refresh_token = refresh_token;
-                        self.logged_in = true;
-                        self.auth_code_input.clear();
-                        self.focus = Some(Focus::CheckUpdates);
+                        self.config.epic_refresh_token = refresh_token;
+                        self.auth.logged_in = true;
+                        self.auth.auth_code_input.clear();
+                        self.gamepad.focus = Some(Focus::CheckUpdates);
 
-                        if let Err(e) = save_config(&self.cfg) {
-                            self.status = format!("Logged in, but failed to save session: {e}");
+                        if let Err(e) = save_config(&self.config) {
+                            self.state.status =
+                                format!("Logged in, but failed to save session: {e}");
                         } else {
-                            self.status = "Logged in. You can launch now.".to_string();
+                            self.state.status = "Logged in. You can launch now.".to_string();
                         }
                     }
-                    Err(e) => self.status = format!("Login failed: {e}"),
+                    Err(e) => self.state.status = format!("Login failed: {e}"),
                 }
                 Task::none()
             }
 
             Message::LaunchPressed => {
-                if self.cfg.rocket_league_path.trim().is_empty() {
-                    self.status = "Set the Rocket League executable path first.".to_string();
+                if self.config.rocket_league_path.trim().is_empty() {
+                    self.state.status = "Set the Rocket League executable path first.".to_string();
                     Task::none()
-                } else if !self.logged_in || self.busy {
+                } else if !self.auth.logged_in || self.state.busy {
                     Task::none()
                 } else {
-                    self.busy = true;
-                    self.status = "Authenticating with Epic Games...".to_string();
-                    let cfg = self.cfg.clone();
+                    self.state.busy = true;
+                    self.state.status = "Authenticating with Epic Games...".to_string();
+                    let cfg = self.config.clone();
                     Task::perform(do_launch(cfg), Message::LaunchFinished)
                 }
             }
             Message::LaunchFinished(result) => {
-                self.busy = false;
+                self.state.busy = false;
                 match result {
-                    Ok(()) => self.status = "Game launched.".to_string(),
-                    Err(e) => self.status = format!("Launch failed: {e}"),
+                    Ok(()) => self.state.status = "Game launched.".to_string(),
+                    Err(e) => self.state.status = format!("Launch failed: {e}"),
                 }
                 Task::none()
             }
 
             Message::CheckUpdatesPressed => {
-                if self.checking_update || self.updating {
+                if self.updates.state == UpdateState::CheckingUpdate
+                    || self.updates.state == UpdateState::Updating
+                {
                     return Task::none();
                 }
-                self.checking_update = true;
-                self.status = "Checking for Rocket League updates via Legendary...".to_string();
+                self.updates.state = UpdateState::CheckingUpdate;
+                self.state.status =
+                    "Checking for Rocket League updates via Legendary...".to_string();
                 Task::perform(
                     async {
                         tokio::task::spawn_blocking(|| {
@@ -272,12 +303,14 @@ impl App {
                 )
             }
             Message::UpdateCheckFinished(result) => {
-                self.checking_update = false;
+                self.updates.state = UpdateState::Idle;
                 match result {
                     Ok(r) => {
-                        self.installed_version = r.installed_version.clone();
-                        self.update_available = r.update_available;
-                        self.status = match (&r.installed_version, r.update_available) {
+                        self.updates.installed_version = r.installed_version.clone();
+                        if r.update_available {
+                            self.updates.state = UpdateState::UpdateAvailable;
+                        }
+                        self.state.status = match (&r.installed_version, r.update_available) {
                             (Some(v), true) => format!(
                                 "Update available (installed: {v}). Click Update to download it."
                             ),
@@ -288,18 +321,20 @@ impl App {
                             }
                         };
                     }
-                    Err(e) => self.status = format!("Update check failed: {e}"),
+                    Err(e) => self.state.status = format!("Update check failed: {e}"),
                 }
                 Task::none()
             }
 
             Message::UpdateNowPressed => {
-                if !self.update_available || self.updating {
+                if self.updates.state != UpdateState::UpdateAvailable
+                    || self.updates.state == UpdateState::Updating
+                {
                     return Task::none();
                 }
-                self.updating = true;
-                self.update_log.clear();
-                self.status = "Updating Rocket League via Legendary...".to_string();
+                self.updates.state = UpdateState::Updating;
+                self.updates.log.clear();
+                self.state.status = "Updating Rocket League via Legendary...".to_string();
 
                 // The updater streams log lines via a sync callback. We bridge
                 // that into an async stream with `stream::try_channel` (new
@@ -346,105 +381,100 @@ impl App {
                 // Find the index of the currently selected theme
                 let current_index = Theme::ALL
                     .iter()
-                    .position(|t| t == &self.cfg.get_theme())
+                    .position(|t| t == &self.config.get_theme())
                     .unwrap_or(0);
 
                 // Calculate the next index, wrapping around to 0 at the end
                 let next_index = (current_index + 1) % Theme::ALL.len();
 
                 // Update the theme
-                self.cfg.theme = Theme::ALL[next_index].to_string().clone();
+                self.config.theme = Theme::ALL[next_index].to_string().clone();
                 Task::none()
             }
             Message::UpdateLogLine(line) => {
-                self.update_log.push(line);
-                if self.update_log.len() > 500 {
-                    let excess = self.update_log.len() - 500;
-                    self.update_log.drain(0..excess);
+                self.updates.log.push(line);
+                if self.updates.log.len() > 500 {
+                    let excess = self.updates.log.len() - 500;
+                    self.updates.log.drain(0..excess);
                 }
                 Task::none()
             }
             Message::UpdateFinished(result) => {
-                self.updating = false;
+                self.updates.state = UpdateState::Idle;
                 match result {
                     Ok(()) => {
-                        self.status = "Update complete.".to_string();
-                        self.update_available = false;
+                        self.state.status = "Update complete.".to_string();
                     }
-                    Err(e) => self.status = format!("Update failed: {e}"),
+                    Err(e) => self.state.status = format!("Update failed: {e}"),
                 }
                 Task::none()
             }
 
             Message::GamepadConnected => {
-                self.gamepad_connected = true;
-                if self.focus.is_none() {
-                    if self.logged_in {
-                        self.focus = Some(Focus::Launch);
+                self.gamepad.connected = true;
+                if self.gamepad.focus.is_none() {
+                    if self.auth.logged_in {
+                        self.gamepad.focus = Some(Focus::Launch);
                     } else {
-                        self.focus = Some(Focus::OpenLogin);
+                        self.gamepad.focus = Some(Focus::OpenLogin);
                     }
                 }
                 Task::none()
             }
             Message::GamepadDisconnected => {
-                self.gamepad_connected = false;
-                self.focus = None;
+                self.gamepad.connected = false;
+                self.gamepad.focus = None;
                 Task::none()
             }
             Message::Gamepad(action) => self.handle_gamepad_action(action),
         }
     }
 
-    /// Mirrors the egui version's `AppMsg::Gamepad` handling, including the
-    /// "Start button launches instantly" shortcut and per-focus activation.
     fn handle_gamepad_action(&mut self, action: GamepadAction) -> Task<Message> {
-        if !self.window_focused {
+        if !self.state.window_focused {
             return Task::none();
         }
 
-        self.gamepad_connected = true;
-        if self.focus.is_none() {
-            self.focus = Some(Focus::AutoDetect);
+        self.gamepad.connected = true;
+        if self.gamepad.focus.is_none() {
+            self.gamepad.focus = Some(Focus::AutoDetect);
         }
 
         match action {
             GamepadAction::Up => {
-                if let Some(focus) = self.focus {
-                    self.focus = Some(focus.navigate(Direction::Up, self.logged_in));
+                if let Some(focus) = self.gamepad.focus {
+                    self.gamepad.focus = Some(focus.navigate(Direction::Up, self.auth.logged_in));
                 }
                 Task::none()
             }
             GamepadAction::Down => {
-                if let Some(focus) = self.focus {
-                    self.focus = Some(focus.navigate(Direction::Down, self.logged_in));
+                if let Some(focus) = self.gamepad.focus {
+                    self.gamepad.focus = Some(focus.navigate(Direction::Down, self.auth.logged_in));
                 }
                 Task::none()
             }
             GamepadAction::Left => {
-                if let Some(focus) = self.focus {
-                    self.focus = Some(focus.navigate(Direction::Left, self.logged_in));
+                if let Some(focus) = self.gamepad.focus {
+                    self.gamepad.focus = Some(focus.navigate(Direction::Left, self.auth.logged_in));
                 }
                 Task::none()
             }
             GamepadAction::Right => {
-                if let Some(focus) = self.focus {
-                    self.focus = Some(focus.navigate(Direction::Right, self.logged_in));
+                if let Some(focus) = self.gamepad.focus {
+                    self.gamepad.focus =
+                        Some(focus.navigate(Direction::Right, self.auth.logged_in));
                 }
                 Task::none()
             }
             GamepadAction::Select => {
-                // Dispatch to whatever action the currently-focused widget
-                // represents, since Iced has no direct "synthesize a click"
-                // equivalent to egui's `response.clicked() || select_pressed`.
-                match self.focus {
+                match self.gamepad.focus {
                     Some(Focus::CheckUpdates) => self.update(Message::CheckUpdatesPressed),
                     Some(Focus::UpdateNow) => self.update(Message::UpdateNowPressed),
                     Some(Focus::SwitchAccount) => self.update(Message::SwitchAccountPressed),
                     Some(Focus::OpenLogin) => self.update(Message::OpenLoginPressed),
                     Some(Focus::Launch) => self.update(Message::LaunchPressed),
                     Some(Focus::SkipEasyAntiCheat) => {
-                        let new_val = !self.cfg.skip_eac;
+                        let new_val = !self.config.skip_eac;
                         self.update(Message::SkipEacToggled(new_val))
                     }
                     Some(Focus::CodeField) => Task::none(), // text field, nothing to "click"
@@ -460,7 +490,10 @@ impl App {
                 }
             }
             GamepadAction::LaunchShortcut => {
-                if self.logged_in && !self.busy && !self.cfg.rocket_league_path.trim().is_empty() {
+                if self.auth.logged_in
+                    && !self.state.busy
+                    && !self.config.rocket_league_path.trim().is_empty()
+                {
                     self.update(Message::LaunchPressed)
                 } else {
                     Task::none()
@@ -469,38 +502,27 @@ impl App {
         }
     }
 
-    fn auto_detect_paths(&mut self) {
+    fn auto_detect_paths(config: &mut Config) -> (&mut Config, Vec<&str>) {
         let found = discovery::discover_all();
         let mut notes = Vec::new();
 
         if let Some(p) = found.rocket_league_path {
-            self.cfg.rocket_league_path = p.to_string_lossy().to_string();
+            config.rocket_league_path = p.to_string_lossy().to_string();
             notes.push("RL exe");
         }
         if let Some(p) = found.steam_install_path {
-            self.cfg.steam_install_path = p.to_string_lossy().to_string();
+            config.steam_install_path = p.to_string_lossy().to_string();
             notes.push("Steam install");
         }
         if let Some(p) = found.proton_path {
-            self.cfg.proton_path = p.to_string_lossy().to_string();
+            config.proton_path = p.to_string_lossy().to_string();
             notes.push("Proton");
         }
         if let Some(p) = found.compat_data_path {
-            self.cfg.compat_data_path = p.to_string_lossy().to_string();
+            config.compat_data_path = p.to_string_lossy().to_string();
             notes.push("Proton prefix");
         }
 
-        self.status = if notes.is_empty() {
-            "Auto-detect found nothing — fill in paths manually.".to_string()
-        } else {
-            format!(
-                "Auto-detected: {}. Review and Save settings.",
-                notes.join(", ")
-            )
-        };
-
-        if let Err(e) = save_config(&self.cfg) {
-            self.status = format!("{} (failed to save: {e})", self.status);
-        }
+        (config, notes)
     }
 }
