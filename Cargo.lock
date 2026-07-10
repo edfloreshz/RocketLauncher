@@ -3560,16 +3560,25 @@ dependencies = [
 name = "rocket-launcher"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "dirs",
  "futures",
  "gilrs",
  "iced",
  "image",
  "reqwest",
+ "rocket-launcher-core",
+ "tokio",
+]
+
+[[package]]
+name = "rocket-launcher-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "iced",
+ "reqwest",
  "serde",
  "serde_json",
- "tokio",
  "uuid",
 ]
 

@@ -13,7 +13,7 @@ use gilrs::{Axis, Button as PadButton, Event as GilEvent, EventType, Gilrs};
 
 use futures::SinkExt;
 
-use rocket_launcher::{
+use rocket_launcher_core::{
     Config, EPIC_LOGIN_URL, LaunchCredentials, discovery, exchange_code_for_refresh_token,
     gamepad::{Direction, Focus, GamepadAction},
     get_launch_credentials, launch_game, load_config, open_browser, save_config, updater,

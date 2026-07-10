@@ -1,0 +1,13 @@
+[package]
+name = "rocket-launcher"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rocket-launcher-core = { workspace = true }
+iced = { workspace = true }
+reqwest = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+gilrs = "0.11.2"
+image = "0.25"
+futures = "0.3"
