@@ -10,7 +10,7 @@ use rocket_launcher_core::{
 };
 
 use crate::types::{Message, UpdateCheckResult, UpdateEvent};
-use crate::worker::{do_launch, gamepad_worker};
+use crate::worker::{gamepad_worker, launch};
 
 #[derive(Debug, Clone)]
 pub struct App {
@@ -265,7 +265,7 @@ impl App {
                     self.state.busy = true;
                     self.state.status = "Authenticating with Epic Games...".to_string();
                     let cfg = self.config.clone();
-                    Task::perform(do_launch(cfg), Message::LaunchFinished)
+                    Task::perform(launch(cfg), Message::LaunchFinished)
                 }
             }
             Message::LaunchFinished(result) => {
@@ -336,18 +336,6 @@ impl App {
                 self.updates.log.clear();
                 self.state.status = "Updating Rocket League via Legendary...".to_string();
 
-                // The updater streams log lines via a sync callback. We bridge
-                // that into an async stream with `stream::try_channel` (new
-                // in 0.14). IMPORTANT: in try_channel, the closure returning
-                // Ok(()) produces NO item on the stream — only Err surfaces
-                // as an item. So a clean completion must be pushed explicitly
-                // as a sentinel value through the channel; it can't be
-                // inferred from the stream simply ending.
-                //
-                // FIX 2 (E0282): the `output` closure parameter's element
-                // type can't be inferred from usage alone here, so it needs
-                // an explicit `futures::channel::mpsc::Sender<UpdateEvent>`
-                // annotation.
                 Task::run(
                     stream::try_channel(
                         100,
@@ -378,16 +366,13 @@ impl App {
                 )
             }
             Message::ThemeSelectorPressed => {
-                // Find the index of the currently selected theme
                 let current_index = Theme::ALL
                     .iter()
                     .position(|t| t == &self.config.get_theme())
                     .unwrap_or(0);
 
-                // Calculate the next index, wrapping around to 0 at the end
                 let next_index = (current_index + 1) % Theme::ALL.len();
 
-                // Update the theme
                 self.config.theme = Theme::ALL[next_index].to_string().clone();
                 Task::none()
             }

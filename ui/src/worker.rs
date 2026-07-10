@@ -3,16 +3,14 @@ use futures::SinkExt;
 use gilrs::{Axis, Button as PadButton, Event as GilEvent, EventType, Gilrs};
 use iced::stream;
 use rocket_launcher_core::{
-    Config, LaunchCredentials, gamepad::GamepadAction, get_launch_credentials, launch_game,
-    save_config,
+    Config, gamepad::GamepadAction, get_launch_credentials, launch_game, save_config,
 };
 
-pub async fn do_launch(mut cfg: Config) -> Result<(), String> {
+pub async fn launch(mut cfg: Config) -> Result<(), String> {
     let client = reqwest::Client::new();
-    let (creds, new_refresh_token): (LaunchCredentials, String) =
-        get_launch_credentials(&client, &cfg.epic_refresh_token)
-            .await
-            .map_err(|e| e.to_string())?;
+    let (creds, new_refresh_token) = get_launch_credentials(&client, &cfg.epic_refresh_token)
+        .await
+        .map_err(|e| e.to_string())?;
 
     if new_refresh_token != cfg.epic_refresh_token {
         cfg.epic_refresh_token = new_refresh_token;
