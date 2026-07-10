@@ -8,6 +8,7 @@ name = "rocket_launcher"
 path = "src/lib.rs"
 
 [dependencies]
+iced = { version = "0.14", features = ["tokio", "image", "advanced"] }
 reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -15,8 +16,6 @@ uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 dirs = "5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
-eframe = { version = "0.35.0", features = ["default", "__screenshot"] }
-egui_extras = { version = "0.35.0", features = ["default", "image"] }
-env_logger = { version = "0.11.11", features = ["auto-color", "humantime"] }
-image = "0.25.10"
 gilrs = "0.11.2"
+image = "0.25"
+futures = "0.3"

@@ -1,6 +1,7 @@
 // Persistent on-disk configuration for the launcher.
 
 use anyhow::{Context, Result, bail};
+use iced::Theme;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -30,6 +31,38 @@ pub struct Config {
     /// bypassing it there risks a ban.
     #[serde(default)]
     pub skip_eac: bool,
+    #[serde(default)]
+    pub theme: String,
+}
+
+impl Config {
+    pub fn get_theme(&self) -> Theme {
+        match self.theme.as_str() {
+            "Light" => Theme::Light,
+            "Dark" => Theme::Dark,
+            "Dracula" => Theme::Dracula,
+            "Nord" => Theme::Nord,
+            "Solarized Light" => Theme::SolarizedLight,
+            "Solarized Dark" => Theme::SolarizedDark,
+            "Gruvbox Light" => Theme::GruvboxLight,
+            "Gruvbox Dark" => Theme::GruvboxDark,
+            "Catppuccin Latte" => Theme::CatppuccinLatte,
+            "Catppuccin Frappé" => Theme::CatppuccinFrappe,
+            "Catppuccin Macchiato" => Theme::CatppuccinMacchiato,
+            "Catppuccin Mocha" => Theme::CatppuccinMocha,
+            "Tokyo Night" => Theme::TokyoNight,
+            "Tokyo Night Storm" => Theme::TokyoNightStorm,
+            "Tokyo Night Light" => Theme::TokyoNightLight,
+            "Kanagawa Wave" => Theme::KanagawaWave,
+            "Kanagawa Dragon" => Theme::KanagawaDragon,
+            "Kanagawa Lotus" => Theme::KanagawaLotus,
+            "Moonfly" => Theme::Moonfly,
+            "Nightfly" => Theme::Nightfly,
+            "Oxocarbon" => Theme::Oxocarbon,
+            "Ferra" => Theme::Ferra,
+            _ => Theme::Ferra,
+        }
+    }
 }
 
 pub fn config_path() -> Result<PathBuf> {
