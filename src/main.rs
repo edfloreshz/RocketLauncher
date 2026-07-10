@@ -52,6 +52,7 @@ enum Message {
     SteamInstallPathChanged(String),
     SkipEacToggled(bool),
     ThemeSelected(Theme),
+    Window(iced::window::Id, iced::window::Event),
 
     // Buttons
     AutoDetectPressed,
@@ -92,6 +93,7 @@ struct App {
     background: image::Handle,
     gamepad_connected: bool,
     focus: Option<Focus>,
+    window_focused: bool,
 }
 
 impl App {
@@ -155,17 +157,29 @@ impl App {
                 background,
                 gamepad_connected: false,
                 focus: None,
+                window_focused: false,
             },
             Task::none(),
         )
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::run(gamepad_worker)
+        let window = iced::window::events().map(|(id, event)| Message::Window(id, event));
+        let gamepad = Subscription::run(gamepad_worker);
+        Subscription::batch(vec![gamepad, window])
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::Window(_, iced::window::Event::Focused) => {
+                self.window_focused = true;
+                Task::none()
+            }
+            Message::Window(_, iced::window::Event::Unfocused) => {
+                self.window_focused = false;
+                Task::none()
+            }
+            Message::Window(_, _) => Task::none(),
             Message::RocketLeaguePathChanged(v) => {
                 self.cfg.rocket_league_path = v;
                 Task::none()
@@ -442,6 +456,10 @@ impl App {
     /// Mirrors the egui version's `AppMsg::Gamepad` handling, including the
     /// "Start button launches instantly" shortcut and per-focus activation.
     fn handle_gamepad_action(&mut self, action: GamepadAction) -> Task<Message> {
+        if !self.window_focused {
+            return Task::none();
+        }
+
         self.gamepad_connected = true;
         if self.focus.is_none() {
             self.focus = Some(Focus::AutoDetect);
