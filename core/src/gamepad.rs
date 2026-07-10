@@ -29,17 +29,16 @@ pub enum Focus {
     UpdateNow,
     Launch,
     ThemeSelector,
+    Exit,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct FocusNode {
     pub focus: Focus,
-
     pub up: Option<Focus>,
     pub down: Option<Focus>,
     pub left: Option<Focus>,
     pub right: Option<Focus>,
-
     pub logged_in_only: bool,
     pub logged_out_only: bool,
 }
@@ -132,6 +131,15 @@ impl Focus {
             up: Some(Focus::ThemeSelector),
             down: None,
             left: Some(Focus::AutoDetect),
+            right: Some(Focus::Exit),
+            logged_in_only: false,
+            logged_out_only: false,
+        },
+        FocusNode {
+            focus: Focus::Exit,
+            up: Some(Focus::ThemeSelector),
+            down: None,
+            left: Some(Focus::SaveSettings),
             right: None,
             logged_in_only: false,
             logged_out_only: false,
@@ -207,6 +215,15 @@ impl Focus {
             up: Some(Focus::ThemeSelector),
             down: None,
             left: Some(Focus::AutoDetect),
+            right: Some(Focus::Exit),
+            logged_in_only: false,
+            logged_out_only: false,
+        },
+        FocusNode {
+            focus: Focus::Exit,
+            up: Some(Focus::ThemeSelector),
+            down: None,
+            left: Some(Focus::SaveSettings),
             right: None,
             logged_in_only: false,
             logged_out_only: false,
