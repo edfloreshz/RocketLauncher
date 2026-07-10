@@ -1,8 +1,8 @@
 use iced::Alignment;
 use iced::theme::Base;
 use iced::widget::{
-    self, button, checkbox, column, container, image, pick_list, row, scrollable, stack, text,
-    text_input,
+    self, Button, button, checkbox, column, container, image, pick_list, row, scrollable, stack,
+    text, text_input,
 };
 use iced::{Background, Border, Element, Font, Length, Theme};
 use rocket_launcher_core::gamepad::Focus;
@@ -35,19 +35,23 @@ impl App {
         focus_variant: Focus,
         message: Message,
         enabled: bool,
-    ) -> Element<'a, Message> {
+    ) -> Button<'a, Message> {
         let is_focused = self.focus == Some(focus_variant);
 
-        let mut b = button(text(label))
+        let mut button = button(text(label))
             .padding([10, 16])
             .style(widget::button::subtle);
-        b = if enabled { b.on_press(message) } else { b };
+        button = if enabled {
+            button.on_press(message)
+        } else {
+            button
+        };
 
         if is_focused {
-            b = b.style(widget::button::primary);
+            button = button.style(widget::button::primary);
         }
 
-        b.into()
+        button
     }
 
     fn settings_panel(&self) -> Element<'_, Message> {
@@ -76,11 +80,9 @@ impl App {
                     self.update_available && !self.updating,
                 ),
             ],
-            if let Some(v) = &self.installed_version {
-                text(format!("Installed version: {v}"))
-            } else {
-                text("")
-            },
+            self.installed_version
+                .as_ref()
+                .map(|v| text(format!("Installed version: {v}"))),
         ]
         .spacing(12);
 
@@ -157,7 +159,7 @@ impl App {
             .spacing(24)
             .width(Length::Fill);
 
-        let login_row: Element<Message> = if !self.logged_in {
+        let login_row: Option<Element<Message>> = (!self.logged_in).then(|| {
             let code_focused = self.focus == Some(Focus::CodeField);
             let mut code_input = text_input(
                 "Paste 32-character authorization code here",
@@ -192,81 +194,112 @@ impl App {
                 ),
             ]
             .into()
+        });
+
+        let status_line = row![
+            text(&self.status).size(14),
+            widget::space::horizontal(),
+            self.focused_button("Exit", Focus::Exit, Message::ExitPressed, true),
+        ];
+
+        let all_paths_set = self.cfg.is_valid();
+
+        // Status Indicator
+        let status_indicator = if all_paths_set {
+            text("System configured correctly.").color(iced::Color::from_rgb(0.0, 0.7, 0.0))
         } else {
-            widget::space().into()
+            text("Paths missing. Auto-detect or configure manually.")
+                .color(iced::Color::from_rgb(0.8, 0.0, 0.0))
         };
 
-        let status_line = text(&self.status).size(14);
-
-        let settings_grid = column![
-            text("Launcher Settings").size(24),
-            labeled_input(
-                "Rocket League Executable:",
-                &self.cfg.rocket_league_path,
-                Message::RocketLeaguePathChanged,
-            ),
-            labeled_input(
-                "Proton Binary Path:",
-                &self.cfg.proton_path,
-                Message::ProtonPathChanged,
-            ),
-            labeled_input(
-                "Compat Data Prefix:",
-                &self.cfg.compat_data_path,
-                Message::CompatDataPathChanged,
-            ),
-            labeled_input(
-                "Steam Install Path:",
-                &self.cfg.steam_install_path,
-                Message::SteamInstallPathChanged,
-            ),
+        let mut settings_grid = column![
             row![
-                container(text("Theme:").size(15)).width(Length::Fixed(220.0)),
-                pick_list(Theme::ALL, Some(self.cfg.get_theme()), |t: Theme| {
-                    Message::ThemeSelected(t)
-                })
-                .width(Length::Fill)
-                .style(move |theme: &Theme, status| {
-                    let mut style = pick_list::default(theme, status);
-                    if self.focus == Some(Focus::ThemeSelector) {
-                        style.border = Border {
-                            color: self.cfg.get_theme().palette().primary,
-                            width: 2.0,
-                            ..Default::default()
-                        }
-                    }
-                    style
-                })
+                text("Launcher Settings").size(24),
+                widget::space::horizontal(),
+                status_indicator
             ]
-            .spacing(20)
-            .align_y(Alignment::Center),
-            row![
-                self.focused_button(
-                    "Auto-detect paths",
-                    Focus::AutoDetect,
-                    Message::AutoDetectPressed,
-                    true,
-                ),
-                widget::space().width(10),
-                self.focused_button(
-                    "Save settings",
-                    Focus::SaveSettings,
-                    Message::SaveSettingsPressed,
-                    true,
-                ),
-                widget::space().width(Length::Fill),
-                self.focused_button("Exit Launcher", Focus::Exit, Message::ExitPressed, true),
-            ],
-        ]
-        .spacing(14);
+            .spacing(14)
+        ];
 
-        let items = if self.logged_in {
-            column![top_row, status_line, scrollable(settings_grid)]
+        if self.show_advanced_settings || !all_paths_set {
+            settings_grid = settings_grid
+                .spacing(14)
+                .push(
+                    column![
+                        labeled_input(
+                            "Rocket League Executable:",
+                            &self.cfg.rocket_league_path,
+                            Message::RocketLeaguePathChanged
+                        ),
+                        labeled_input(
+                            "Proton Binary Path:",
+                            &self.cfg.proton_path,
+                            Message::ProtonPathChanged
+                        ),
+                        labeled_input(
+                            "Compat Data Prefix:",
+                            &self.cfg.compat_data_path,
+                            Message::CompatDataPathChanged
+                        ),
+                        labeled_input(
+                            "Steam Install Path:",
+                            &self.cfg.steam_install_path,
+                            Message::SteamInstallPathChanged
+                        ),
+                    ]
+                    .spacing(14),
+                )
+                .push(
+                    column![
+                        row![
+                            container(text("Theme:").size(15)).width(Length::Fixed(220.0)),
+                            pick_list(
+                                Theme::ALL,
+                                Some(self.cfg.get_theme()),
+                                Message::ThemeSelected
+                            )
+                            .width(Length::Fill)
+                        ]
+                        .spacing(20)
+                        .align_y(Alignment::Center),
+                        row![
+                            self.focused_button(
+                                "Auto-detect paths",
+                                Focus::AutoDetect,
+                                Message::AutoDetectPressed,
+                                true
+                            ),
+                            widget::space().width(10),
+                            self.focused_button(
+                                "Save settings",
+                                Focus::SaveSettings,
+                                Message::SaveSettingsPressed,
+                                true
+                            ),
+                        ]
+                    ]
+                    .spacing(14),
+                );
+        }
+
+        let show_advanced_settings_label = if self.show_advanced_settings {
+            "Hide Advanced Settings"
         } else {
-            column![top_row, login_row, status_line, scrollable(settings_grid)]
+            "Show Advanced Settings"
         };
+        settings_grid = settings_grid.spacing(14).push(
+            self.focused_button(
+                show_advanced_settings_label,
+                Focus::ToggleAdvancedSettings,
+                Message::ToggleAdvancedSettings,
+                true,
+            )
+            .on_press(Message::ToggleAdvancedSettings),
+        );
 
-        let body = items.spacing(16).width(Length::Fixed(1000.0));
+        let body = column![top_row, login_row, scrollable(settings_grid), status_line]
+            .spacing(16)
+            .width(Length::Fixed(1000.0));
 
         container(body)
             .padding(24)

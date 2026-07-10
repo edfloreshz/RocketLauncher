@@ -36,6 +36,12 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn is_valid(&self) -> bool {
+        !self.rocket_league_path.is_empty()
+            && !self.proton_path.is_empty()
+            && !self.compat_data_path.is_empty()
+    }
+
     pub fn get_theme(&self) -> Theme {
         match self.theme.as_str() {
             "Light" => Theme::Light,

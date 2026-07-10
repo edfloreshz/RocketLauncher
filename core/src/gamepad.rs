@@ -29,6 +29,7 @@ pub enum Focus {
     UpdateNow,
     Launch,
     ThemeSelector,
+    ToggleAdvancedSettings,
     Exit,
 }
 
@@ -48,7 +49,7 @@ impl Focus {
         FocusNode {
             focus: Focus::CheckUpdates,
             up: None,
-            down: Some(Focus::AutoDetect),
+            down: Some(Focus::ToggleAdvancedSettings),
             left: None,
             right: Some(Focus::UpdateNow),
             logged_in_only: false,
@@ -57,7 +58,7 @@ impl Focus {
         FocusNode {
             focus: Focus::UpdateNow,
             up: None,
-            down: Some(Focus::ThemeSelector),
+            down: Some(Focus::ToggleAdvancedSettings),
             left: Some(Focus::CheckUpdates),
             right: Some(Focus::OpenLogin),
             logged_in_only: false,
@@ -93,7 +94,7 @@ impl Focus {
         FocusNode {
             focus: Focus::CodeField,
             up: Some(Focus::OpenLogin),
-            down: Some(Focus::ThemeSelector),
+            down: Some(Focus::ToggleAdvancedSettings),
             left: None,
             right: Some(Focus::SubmitCode),
             logged_in_only: false,
@@ -119,7 +120,7 @@ impl Focus {
         },
         FocusNode {
             focus: Focus::AutoDetect,
-            up: Some(Focus::CheckUpdates),
+            up: Some(Focus::ToggleAdvancedSettings),
             down: None,
             left: None,
             right: Some(Focus::SaveSettings),
@@ -144,13 +145,22 @@ impl Focus {
             logged_in_only: false,
             logged_out_only: false,
         },
+        FocusNode {
+            focus: Focus::ToggleAdvancedSettings,
+            up: Some(Focus::CheckUpdates),
+            down: Some(Focus::AutoDetect),
+            left: None,
+            right: Some(Focus::ThemeSelector),
+            logged_in_only: false,
+            logged_out_only: false,
+        },
     ];
 
     const LOGGED_IN_NODES: &'static [FocusNode] = &[
         FocusNode {
             focus: Focus::CheckUpdates,
             up: None,
-            down: Some(Focus::AutoDetect),
+            down: Some(Focus::ToggleAdvancedSettings),
             left: None,
             right: Some(Focus::UpdateNow),
             logged_in_only: false,
@@ -159,7 +169,7 @@ impl Focus {
         FocusNode {
             focus: Focus::UpdateNow,
             up: None,
-            down: Some(Focus::ThemeSelector),
+            down: Some(Focus::ToggleAdvancedSettings),
             left: Some(Focus::CheckUpdates),
             right: Some(Focus::SwitchAccount),
             logged_in_only: false,
@@ -203,7 +213,7 @@ impl Focus {
         },
         FocusNode {
             focus: Focus::AutoDetect,
-            up: Some(Focus::CheckUpdates),
+            up: Some(Focus::ToggleAdvancedSettings),
             down: None,
             left: None,
             right: Some(Focus::SaveSettings),
@@ -225,6 +235,15 @@ impl Focus {
             down: None,
             left: Some(Focus::SaveSettings),
             right: None,
+            logged_in_only: false,
+            logged_out_only: false,
+        },
+        FocusNode {
+            focus: Focus::ToggleAdvancedSettings,
+            up: Some(Focus::CheckUpdates),
+            down: Some(Focus::AutoDetect),
+            left: None,
+            right: Some(Focus::ThemeSelector),
             logged_in_only: false,
             logged_out_only: false,
         },

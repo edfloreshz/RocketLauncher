@@ -36,6 +36,7 @@ pub enum Message {
     UpdateNowPressed,
     ThemeSelectorPressed,
     ExitPressed,
+    ToggleAdvancedSettings,
 
     // Async completions
     LoginFinished(Result<String, String>),

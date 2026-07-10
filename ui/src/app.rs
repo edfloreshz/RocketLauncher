@@ -28,6 +28,7 @@ pub struct App {
     pub focus: Option<Focus>,
     pub window_id: iced::window::Id,
     pub window_focused: bool,
+    pub show_advanced_settings: bool,
 }
 
 impl App {
@@ -93,6 +94,7 @@ impl App {
                 focus: None,
                 window_focused: false,
                 window_id: iced::window::Id::unique(),
+                show_advanced_settings: false,
             },
             Task::none(),
         )
@@ -106,6 +108,10 @@ impl App {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::ToggleAdvancedSettings => {
+                self.show_advanced_settings = !self.show_advanced_settings;
+                Task::none()
+            }
             Message::ExitPressed => iced::window::close(self.window_id),
             Message::Window(id, iced::window::Event::Focused) => {
                 self.window_id = id;
@@ -446,6 +452,9 @@ impl App {
                     Some(Focus::AutoDetect) => self.update(Message::AutoDetectPressed),
                     Some(Focus::SaveSettings) => self.update(Message::SaveSettingsPressed),
                     Some(Focus::ThemeSelector) => self.update(Message::ThemeSelectorPressed),
+                    Some(Focus::ToggleAdvancedSettings) => {
+                        self.update(Message::ToggleAdvancedSettings)
+                    }
                     Some(Focus::Exit) => self.update(Message::ExitPressed),
                     None => Task::none(),
                 }
