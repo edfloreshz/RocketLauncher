@@ -52,7 +52,7 @@ enum Message {
     SteamInstallPathChanged(String),
     SkipEacToggled(bool),
     ThemeSelected(Theme),
-    Window(iced::window::Id, iced::window::Event),
+    Window(iced::window::Event),
 
     // Buttons
     AutoDetectPressed,
@@ -164,22 +164,22 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let window = iced::window::events().map(|(id, event)| Message::Window(id, event));
+        let window = iced::window::events().map(|(_, event)| Message::Window(event));
         let gamepad = Subscription::run(gamepad_worker);
         Subscription::batch(vec![gamepad, window])
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Window(_, iced::window::Event::Focused) => {
+            Message::Window(iced::window::Event::Focused) => {
                 self.window_focused = true;
                 Task::none()
             }
-            Message::Window(_, iced::window::Event::Unfocused) => {
+            Message::Window(iced::window::Event::Unfocused) => {
                 self.window_focused = false;
                 Task::none()
             }
-            Message::Window(_, _) => Task::none(),
+            Message::Window(_) => Task::none(),
             Message::RocketLeaguePathChanged(v) => {
                 self.cfg.rocket_league_path = v;
                 Task::none()
