@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["core", "rocket-launcher"]
+members = ["core", "ui"]
 
 [workspace.dependencies]
 rocket-launcher-core = { path = "core" }
