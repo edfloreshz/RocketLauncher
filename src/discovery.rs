@@ -71,22 +71,52 @@ fn steam_library_folders(steam_path: &Path) -> Vec<PathBuf> {
     libs
 }
 
-/// Searches all Steam library folders for a Proton build, preferring the
-/// newest-looking name (simple lexicographic max on folder name, which
-/// works fine for "Proton 7.0", "Proton 8.0", "Proton 9.0", "Proton Experimental").
+/// Searches standard Steam library folders, custom compatibility tool folders,
+/// and third-party launchers (ProtonPlus, Heroic) for a Proton build.
+/// Prefers "Experimental" or the newest-looking version string name.
 pub fn find_proton(steam_path: Option<&Path>) -> Option<PathBuf> {
     let steam_path = steam_path.map(PathBuf::from).or_else(find_steam_install)?;
     let mut found: Vec<PathBuf> = Vec::new();
 
+    // 1. Scan official Steam library folders (e.g., "common/Proton 8.0")
     for lib in steam_library_folders(&steam_path) {
         let common = lib.join("common");
-        let Ok(entries) = std::fs::read_dir(&common) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with("Proton") {
+        if let Ok(entries) = std::fs::read_dir(&common) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                // Expanded to match custom builds that might place "Proton" anywhere in the name
+                if name.contains("Proton") || name.contains("proton") {
+                    let proton_bin = entry.path().join("proton");
+                    if proton_bin.is_file() {
+                        found.push(proton_bin);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Build a list of external custom paths to search
+    let mut custom_paths = vec![
+        // Native Steam custom compatibility tools (ProtonPlus / ProtonUp-Qt target)
+        steam_path.join("compatibilitytools.d"),
+    ];
+
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        custom_paths.extend(vec![
+            // Flatpak Steam custom compatibility tools path
+            home.join(".var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d"),
+            // Heroic Games Launcher (Native installation path)
+            home.join(".config/heroic/tools/proton"),
+            // Heroic Games Launcher (Flatpak installation path)
+            home.join(".var/app/com.heroicgameslauncher.hgl/config/heroic/tools/proton"),
+        ]);
+    }
+
+    // 3. Scan the custom tool paths
+    for dir in custom_paths {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
                 let proton_bin = entry.path().join("proton");
                 if proton_bin.is_file() {
                     found.push(proton_bin);
@@ -95,9 +125,20 @@ pub fn find_proton(steam_path: Option<&Path>) -> Option<PathBuf> {
         }
     }
 
-    // Prefer "Experimental" if present, otherwise the lexicographically
-    // greatest version string (e.g. "Proton 9.0" > "Proton 8.0").
-    found.sort();
+    if found.is_empty() {
+        return None;
+    }
+
+    // Sort by the immediate parent folder name (the version string)
+    // to keep sorting accurate across completely different path roots.
+    found.sort_by_cached_key(|path| {
+        path.parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+
+    // Prefer "Experimental" if present, otherwise fallback to the lexicographically newest name
     found
         .iter()
         .find(|p| p.to_string_lossy().contains("Experimental"))
@@ -123,7 +164,7 @@ pub fn find_or_suggest_compat_data(steam_path: Option<&Path>) -> Option<PathBuf>
 
     // Nothing existing found — suggest a fresh, clearly-named prefix
     // next to the main Steam install so the user can just accept it.
-    Some(steam_path.join("steamapps/compatdata/rocketleague-epic"))
+    Some(steam_path.join("steamapps/compatdata/252950"))
 }
 
 /// Candidate locations where an Epic Games install of Rocket League's
